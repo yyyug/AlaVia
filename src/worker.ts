@@ -13,6 +13,7 @@ type Json = Record<string, unknown>;
 const DAY = 60 * 60 * 24;
 const TTL_365_DAYS = 365 * DAY;
 const CACHE_MAX_AGE_SECONDS = DAY;
+const GEOCODE_TTL_SECONDS = 30 * DAY;
 
 const PRICES = {
   placesNearby: 0.032,
@@ -50,6 +51,17 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
   const countryCode = String(body.countryCode || "").trim().toLowerCase();
   if (!query) {
     throw new Error("query is required");
+  }
+
+  const cacheKey = await buildCacheKey("geocode-autobbox-v1", {
+    query: query.toLowerCase(),
+    countryCode,
+  });
+  const edgeReq = new Request(`https://cache.local/geocode/${cacheKey}`);
+  const edgeHit = await caches.default.match(edgeReq);
+  if (edgeHit) {
+    const cached = (await edgeHit.json()) as Json;
+    return json(cached);
   }
 
   const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
@@ -121,7 +133,7 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
     east = lon + radius;
   }
 
-  return json({
+  const payload = {
     ok: true,
     query,
     countryCode: resolvedCountryCode ? resolvedCountryCode.toUpperCase() : (normalizedCountry ? normalizedCountry.toUpperCase() : null),
@@ -132,7 +144,19 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
       north,
       east,
     },
-  });
+  };
+
+  await caches.default.put(
+    edgeReq,
+    new Response(JSON.stringify(payload), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": `public, max-age=${GEOCODE_TTL_SECONDS}`,
+      },
+    }),
+  );
+
+  return json(payload);
 }
 
 async function fetchNominatimSearch(query: string, countryCode = ""): Promise<Array<Record<string, unknown>>> {
