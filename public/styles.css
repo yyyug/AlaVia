@@ -1,0 +1,163 @@
+:root {
+  --bg: #f3f4ee;
+  --paper: #fffef8;
+  --ink: #1f2a21;
+  --accent: #0e7a4b;
+  --accent-soft: #d8efe3;
+  --warn: #7a2e0e;
+  --muted: #5e665f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at 10% 10%, #eef8f1 0%, var(--bg) 45%, #e7ece6 100%);
+}
+
+.container {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+h1, h2 {
+  margin: 0 0 12px;
+}
+
+.lead {
+  color: var(--muted);
+}
+
+.panel {
+  background: var(--paper);
+  border: 1px solid #d3dbd3;
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  margin: 10px 0;
+}
+
+#roadNameHint {
+  display: block;
+  margin-top: -4px;
+  margin-bottom: 6px;
+}
+
+.bbox-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.actions-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+input {
+  width: 100%;
+  margin-top: 6px;
+  border: 1px solid #b8c4b9;
+  border-radius: 10px;
+  padding: 10px;
+  font-size: 16px;
+}
+
+button {
+  border: 1px solid #9ca89d;
+  background: #f8faf5;
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button.paid {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+button[disabled] {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.intersection-list {
+  display: grid;
+  gap: 14px;
+}
+
+.intersection-card {
+  border: 1px solid #cad5ca;
+  border-radius: 12px;
+  padding: 12px;
+  background: #fcfdf9;
+}
+
+.intersection-card:focus {
+  outline: 2px solid #1f7f55;
+  outline-offset: 2px;
+}
+
+.minor {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.costs {
+  font-size: 14px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.result {
+  margin-top: 10px;
+  border-left: 4px solid #c9d8c9;
+  padding-left: 12px;
+  white-space: pre-wrap;
+}
+
+.reading {
+  margin-top: 10px;
+  min-height: 70px;
+  line-height: 1.7;
+}
+
+.reading .active {
+  background: #ffe08a;
+  border-radius: 4px;
+}
+
+.error {
+  color: var(--warn);
+}
+
+.warning {
+  color: #8a5a00;
+}
+
+@media (max-width: 680px) {
+  .bbox-grid {
+    grid-template-columns: 1fr;
+  }
+}

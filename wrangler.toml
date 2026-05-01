@@ -1,0 +1,26 @@
+name = "alavia"
+main = "src/worker.ts"
+compatibility_date = "2026-05-01"
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "alavia"
+database_id = "947b5026-bfad-4b5f-9688-dc6d0b5fad84"
+
+[[r2_buckets]]
+binding = "CACHE_BUCKET"
+bucket_name = "alavia-cache"
+
+[vars]
+GOOGLE_MAPS_LANGUAGE = "zh-TW"
+ALLOWED_ACCESS_EMAILS = "yoofun@gmail.com"
+# Optional: comma-separated invited users when protected by Cloudflare Access.
+# ALLOWED_ACCESS_EMAILS = "you@example.com,teammate@example.com"
+
+# Add secrets with:
+# wrangler secret put GOOGLE_MAPS_API_KEY
+# wrangler secret put GOOGLE_VISION_API_KEY
