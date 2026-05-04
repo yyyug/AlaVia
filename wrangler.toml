@@ -16,11 +16,34 @@ binding = "CACHE_BUCKET"
 bucket_name = "alavia-cache"
 
 [vars]
-GOOGLE_MAPS_LANGUAGE = "zh-TW"
 ALLOWED_ACCESS_EMAILS = "yoofun@gmail.com"
+ALLOW_DEV_BYPASS = "false"
 # Optional: comma-separated invited users when protected by Cloudflare Access.
 # ALLOWED_ACCESS_EMAILS = "you@example.com,teammate@example.com"
+# Optional: expected Clerk JWT audience (when set, aud must match exactly).
+# CLERK_JWT_AUDIENCE = "https://via.inclu.si"
+
+[env.production]
+routes = [
+	{ pattern = "via.inclu.si/*", zone_name = "inclu.si" },
+]
+
+[env.production.vars]
+ALLOWED_ACCESS_EMAILS = ""
+ALLOW_DEV_BYPASS = "false"
+# CLERK_JWT_AUDIENCE = "https://via.inclu.si"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "alavia"
+database_id = "947b5026-bfad-4b5f-9688-dc6d0b5fad84"
+
+[[env.production.r2_buckets]]
+binding = "CACHE_BUCKET"
+bucket_name = "alavia-cache"
 
 # Add secrets with:
 # wrangler secret put GOOGLE_MAPS_API_KEY
-# wrangler secret put GOOGLE_VISION_API_KEY
+# wrangler secret put GEMINI_API_KEY
+# wrangler secret put CLERK_SECRET_KEY
+# wrangler secret put CLERK_WEBHOOK_SECRET   (optional, for webhook signature verification)

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AlaVia 管理後台</title>
+    <script src="https://cdn.jsdelivr.net/npm/@clerk/clerk-js@4/dist/clerk.browser.js" crossorigin="anonymous" data-clerk-publishable-key="pk_test_cG9zc2libGUtc2tpbmstNC5jbGVyay5hY2NvdW50cy5kZXYk"></script>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 860px; margin: 0 auto; padding: 16px; }
+      h1 { font-size: 1.4rem; margin-bottom: 4px; }
+      #auth-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding: 8px 0; border-bottom: 1px solid #ddd; }
+      #status { margin: 16px 0; color: #555; }
+      table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+      th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
+      th { background: #f5f5f5; font-weight: 600; }
+      .badge-approved { color: #166534; background: #dcfce7; padding: 2px 8px; border-radius: 999px; font-size: 0.8rem; }
+      .badge-pending  { color: #92400e; background: #fef3c7; padding: 2px 8px; border-radius: 999px; font-size: 0.8rem; }
+      .badge-admin    { color: #1e40af; background: #dbeafe; padding: 2px 8px; border-radius: 999px; font-size: 0.8rem; }
+      button.action { padding: 4px 12px; cursor: pointer; border-radius: 4px; border: 1px solid #ccc; font-size: 0.85rem; }
+      button.approve { background: #166534; color: white; border-color: #166534; }
+      button.reject  { background: #991b1b; color: white; border-color: #991b1b; }
+      #msg { padding: 8px 12px; border-radius: 4px; margin: 8px 0; display: none; }
+      #msg.ok  { background: #dcfce7; color: #166534; }
+      #msg.err { background: #fee2e2; color: #991b1b; }
+    </style>
+  </head>
+  <body>
+    <h1>AlaVia 管理後台 Admin Panel</h1>
+    <div id="auth-bar">
+      <span id="admin-email" style="font-size:0.9rem;color:#555;"></span>
+      <button id="sign-out-btn" style="display:none;padding:4px 12px;cursor:pointer;">登出 Sign Out</button>
+      <button id="sign-in-btn" style="padding:4px 12px;cursor:pointer;">登入 Sign In</button>
+    </div>
+    <div id="not-admin" style="display:none;color:#991b1b;padding:16px 0;">您的帳號沒有管理員權限。Not an admin.</div>
+    <div id="admin-panel" style="display:none;">
+      <div id="msg"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+        <button id="refresh-btn" style="padding:6px 14px;cursor:pointer;">重新整理 Refresh</button>
+        <button id="refresh-cache-btn" style="padding:6px 14px;cursor:pointer;">更新快取統計 Refresh Cache Stats</button>
+        <button id="purge-expired-cache-btn" style="padding:6px 14px;cursor:pointer;">清理過期快取 Purge Expired</button>
+        <a href="/admin-cache.html" style="display:inline-flex;align-items:center;padding:6px 14px;border:1px solid #ccc;border-radius:4px;text-decoration:none;color:#111;background:#fff;">街道路段快取清單 Street Cache Index</a>
+      </div>
+
+      <div id="cache-summary" style="display:none;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:12px;background:#fafafa;">
+        <div style="font-weight:600;margin-bottom:8px;">Cache 用量 Cache Storage</div>
+        <div id="cache-summary-top" style="font-size:0.9rem;color:#444;margin-bottom:8px;"></div>
+        <table id="cache-provider-table" style="width:100%;font-size:0.9rem;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Entries</th>
+              <th>Expired</th>
+              <th>Missing Object</th>
+              <th>Size (MiB)</th>
+            </tr>
+          </thead>
+          <tbody id="cache-provider-tbody"></tbody>
+        </table>
+      </div>
+
+      <div id="status">載入中...</div>
+      <table id="user-table" style="display:none;">
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>狀態 Status</th>
+            <th>角色 Role</th>
+            <th>Estimated USD</th>
+            <th>Actual USD</th>
+            <th>加入時間</th>
+            <th>操作 Actions</th>
+          </tr>
+        </thead>
+        <tbody id="user-tbody"></tbody>
+      </table>
+    </div>
+
+    <script type="module" src="/admin.js"></script>
+  </body>
+</html>

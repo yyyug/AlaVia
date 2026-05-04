@@ -3,42 +3,185 @@ export interface Env {
   DB: D1Database;
   CACHE_BUCKET: R2Bucket;
   GOOGLE_MAPS_API_KEY?: string;
-  GOOGLE_VISION_API_KEY?: string;
-  GOOGLE_MAPS_LANGUAGE?: string;
+  GEMINI_API_KEY?: string;
   ALLOWED_ACCESS_EMAILS?: string;
+  CLERK_SECRET_KEY?: string;
+  CLERK_WEBHOOK_SECRET?: string;
+  CLERK_JWT_AUDIENCE?: string;
+  ALLOW_DEV_BYPASS?: string;
 }
 
 type Json = Record<string, unknown>;
+type ClerkJwtPayload = {
+  sub: string;
+  exp: number;
+  iss?: string;
+  aud?: string | string[];
+  nbf?: number;
+  iat?: number;
+};
+type TurnCandidate = {
+  roadName: string;
+  bearing: number;
+  direction: string;
+  delta: number;
+};
+
+type IntersectionRow = {
+  id: number;
+  lat: number;
+  lon: number;
+  name: string;
+  crossStreets: string[];
+  type: string;
+  bearingToNext: number | null;
+  directionToNext: string | null;
+  distanceToNext: number;
+  addressLabel: string | null;
+  addressSource: string | null;
+  leftTurn: TurnCandidate | null;
+  rightTurn: TurnCandidate | null;
+};
+type OsmPlaceCandidate = {
+  id: string;
+  lat: number;
+  lon: number;
+  title: string;
+  addressLabel: string | null;
+  kindLabel: string | null;
+  streetName: string | null;
+  distanceMeters: number;
+  sortMeters: number;
+  distanceToLineMeters: number;
+  onTargetRoad: boolean;
+  hasHouseNumber: boolean;
+  hasExplicitName: boolean;
+  hasFeatureTag: boolean;
+};
+
+type OsmCoverageAssessment = {
+  onRoadAddressCount: number;
+  onRoadNamedCount: number;
+  totalCount: number;
+  likelyCommercialUnnamed: boolean;
+  shouldFallback: boolean;
+  reason: string;
+};
+
+type GoogleRoutePlaceCandidate = {
+  id: string;
+  title: string;
+  typeLabel: string | null;
+  addressLabel: string | null;
+  lat: number;
+  lon: number;
+  sortMeters: number;
+  distanceToLineMeters: number;
+};
 
 const DAY = 60 * 60 * 24;
 const TTL_365_DAYS = 365 * DAY;
 const CACHE_MAX_AGE_SECONDS = DAY;
 const GEOCODE_TTL_SECONDS = 30 * DAY;
+const OSM_CACHE_TTL_SECONDS = TTL_365_DAYS;
+const OSM_CACHE_STALE_SECONDS = 30 * DAY;
+const OVERPASS_TIMEOUT_MS = 30000;
+const OVERPASS_PLACE_TIMEOUT_MS = 15000;
+const OVERPASS_MAX_ITERATIONS = 2;
+const OVERPASS_MIN_GROWTH_RATIO = 0.05;
+const CLERK_DOMAIN = "possible-skink-4.clerk.accounts.dev";
+const CLERK_ISSUER = `https://${CLERK_DOMAIN}`;
+const EXTERNAL_API_TIMEOUT_MS = 10000;
+const MAX_PAID_INTERSECTIONS = 50;
+const MAX_REQUEST_BODY_BYTES = 100_000;
+const WEBHOOK_MAX_SKEW_SECONDS = 300;
+const RATE_LIMIT_WINDOW_SECONDS = 60;
+const RATE_LIMIT_DEFAULT_PER_WINDOW = 120;
+const RATE_LIMIT_PAID_PER_WINDOW = 30;
 
 const PRICES = {
-  placesNearby: 0.032,
+  placesNearby: 0.005,
   streetViewStatic: 0.007,
-  visionAnnotate: 0.0015,
+  geminiGenerate: 0.0003,
 };
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname.startsWith("/api/") && url.pathname !== "/api/clerk/webhook") {
+      try {
+        await enforceGatewayPolicies(request, env, url.pathname);
+      } catch (err) {
+        return withErrorHandling(async () => {
+          throw err;
+        });
+      }
+    }
+
     if (url.pathname === "/api/geocode/autobbox" && request.method === "POST") {
       return withErrorHandling(() => handleGeocodeAutoBbox(request));
     }
+    if (url.pathname === "/api/geocode/reverse-road" && request.method === "POST") {
+      return withErrorHandling(() => handleGeocodeReverseRoad(request, env, ctx));
+    }
     if (url.pathname === "/api/overpass/segment" && request.method === "POST") {
-      return withErrorHandling(() => handleOverpassSegment(request));
+      return withErrorHandling(() => handleOverpassSegment(request, env, ctx));
     }
     if (url.pathname === "/api/paid/places" && request.method === "POST") {
       return withErrorHandling(() => handlePaidPlaces(request, env, ctx));
     }
+
     if (url.pathname === "/api/paid/streetview" && request.method === "POST") {
       return withErrorHandling(() => handlePaidStreetView(request, env, ctx));
     }
+    if (url.pathname === "/api/streetview/metadata" && request.method === "POST") {
+      return withErrorHandling(() => handleStreetViewMetadata(request, env));
+    }
+    if (url.pathname === "/api/admin/cleanup-noimage" && request.method === "POST") {
+      return withErrorHandling(() => handleCleanupNoImage(request, env));
+    }
+    if (url.pathname === "/api/admin/streetview-storage" && request.method === "POST") {
+      return withErrorHandling(() => handleStreetViewStorageReport(request, env));
+    }
     if (url.pathname === "/api/paid/route-scenery" && request.method === "POST") {
       return withErrorHandling(() => handlePaidRouteScenery(request, env, ctx));
+    }
+    if (url.pathname === "/api/osm/route-places" && request.method === "POST") {
+      return withErrorHandling(() => handleOsmRoutePlaces(request, env, ctx));
+    }
+    if (url.pathname === "/api/google/route-places" && request.method === "POST") {
+      return withErrorHandling(() => handleGoogleRoutePlaces(request, env, ctx));
+    }
+    if (url.pathname === "/api/intersections/address-batch" && request.method === "POST") {
+      return withErrorHandling(() => handleIntersectionAddressBatch(request, env, ctx));
+    }
+    if (url.pathname === "/api/me" && request.method === "GET") {
+      return withErrorHandling(() => handleMe(request, env));
+    }
+    if (url.pathname === "/api/billing/summary" && request.method === "GET") {
+      return withErrorHandling(() => handleBillingSummary(request, env));
+    }
+    if (url.pathname === "/api/admin/users" && request.method === "GET") {
+      return withErrorHandling(() => handleAdminListUsers(request, env));
+    }
+    if (url.pathname === "/api/admin/billing-summary" && request.method === "GET") {
+      return withErrorHandling(() => handleAdminBillingSummary(request, env));
+    }
+    if (url.pathname === "/api/admin/approve-user" && request.method === "POST") {
+      return withErrorHandling(() => handleAdminApproveUser(request, env));
+    }
+    if (url.pathname === "/api/admin/cache-stats" && request.method === "GET") {
+      return withErrorHandling(() => handleAdminCacheStats(request, env));
+    }
+    if (url.pathname === "/api/admin/cache-purge-expired" && request.method === "POST") {
+      return withErrorHandling(() => handleAdminCachePurgeExpired(request, env));
+    }
+    if (url.pathname === "/api/admin/cache-streets" && request.method === "GET") {
+      return withErrorHandling(() => handleAdminCacheStreets(request, env));
+    }
+    if (url.pathname === "/api/clerk/webhook" && request.method === "POST") {
+      return withErrorHandling(() => handleClerkWebhook(request, env));
     }
 
     return env.ASSETS.fetch(request);
@@ -58,7 +201,7 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
     countryCode,
   });
   const edgeReq = new Request(`https://cache.local/geocode/${cacheKey}`);
-  const edgeHit = await caches.default.match(edgeReq);
+  const edgeHit = await getEdgeCache().match(edgeReq);
   if (edgeHit) {
     const cached = (await edgeHit.json()) as Json;
     return json(cached);
@@ -138,6 +281,9 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
     query,
     countryCode: resolvedCountryCode ? resolvedCountryCode.toUpperCase() : (normalizedCountry ? normalizedCountry.toUpperCase() : null),
     displayName: String(first.display_name || query),
+    roadName: extractRoadNameFromGeocodeRecord(first, query),
+    lat: Number(first.lat),
+    lon: Number(first.lon),
     bbox: {
       south,
       west,
@@ -146,7 +292,7 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
     },
   };
 
-  await caches.default.put(
+  await getEdgeCache().put(
     edgeReq,
     new Response(JSON.stringify(payload), {
       headers: {
@@ -157,6 +303,81 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
   );
 
   return json(payload);
+}
+
+async function handleGeocodeReverseRoad(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  validateCoordinates(lat, lon);
+
+  const reverse = await fetchNominatimReverse(env, lat, lon, ctx);
+  const roadName = extractRoadNameFromGeocodeRecord(reverse, "");
+  if (!roadName) {
+    throw new Error("Reverse geocode road not found");
+  }
+
+  const address = ((reverse.address || {}) as Json);
+  return json({
+    ok: true,
+    lat: round6(lat),
+    lon: round6(lon),
+    roadName,
+    displayName: String(reverse.display_name || roadName),
+    country: String(address.country || "").trim(),
+    countryCode: String(address.country_code || "").trim().toUpperCase() || null,
+  });
+}
+
+function extractRoadNameFromGeocodeRecord(record: Record<string, unknown>, fallback: string): string {
+  const address = ((record.address || {}) as Json);
+  const candidates = [
+    address.road,
+    address.pedestrian,
+    address.highway,
+    address.residential,
+    address.footway,
+    address.path,
+    address.cycleway,
+    record.name,
+    String(record.display_name || "").split(",")[0],
+    fallback,
+  ];
+
+  for (const raw of candidates) {
+    const value = String(raw || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = EXTERNAL_API_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort("fetch-timeout"), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function validateCoordinates(lat: number, lon: number): void {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("Coordinates must be valid numbers");
+  }
+  if (lat < -90 || lat > 90) {
+    throw new Error("Latitude must be between -90 and 90");
+  }
+  if (lon < -180 || lon > 180) {
+    throw new Error("Longitude must be between -180 and 180");
+  }
 }
 
 async function fetchNominatimSearch(query: string, countryCode = ""): Promise<Array<Record<string, unknown>>> {
@@ -171,7 +392,7 @@ async function fetchNominatimSearch(query: string, countryCode = ""): Promise<Ar
   }
 
   const url = `https://nominatim.openstreetmap.org/search?${p.toString()}`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "GET",
     headers: {
       accept: "application/json",
@@ -185,230 +406,1355 @@ async function fetchNominatimSearch(query: string, countryCode = ""): Promise<Ar
   return Array.isArray(items) ? items : [];
 }
 
-async function handleOverpassSegment(request: Request): Promise<Response> {
+async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await requireJson(request);
   const roadName = String(body.roadName || "").trim();
-  const bbox = (body.bbox || {}) as Json;
-  const south = Number(bbox.south);
-  const west = Number(bbox.west);
-  const north = Number(bbox.north);
-  const east = Number(bbox.east);
+  const countryCode = String(body.countryCode || "").trim().toLowerCase();
 
   if (!roadName) {
     throw new Error("roadName is required");
   }
-  if (![south, west, north, east].every(Number.isFinite)) {
-    throw new Error("bbox must include south, west, north, east");
-  }
 
-  const normRoadName = normalizeRoadName(roadName);
-  const queryTokens = tokenizeRoadQuery(roadName);
+  await ensureD1Schema(env);
+  // Cache key uses only normalized road name — no bbox — so repeated queries for
+  // the same road always hit the same cache entry regardless of Nominatim variance.
+  const cachePayload = {
+    roadName: normalizeRoadName(roadName),
+    countryCode,
+    version: 5,
+  };
 
-  const initialBbox: BBox = { south, west, north, east };
-  let currentBbox: BBox = { ...initialBbox };
-  let stabilizedReason = "max_iterations_reached";
-  let iterationCount = 0;
-  let previousMatchedIds = new Set<number>();
+  const cached = await getOrCreateCached(
+    env,
+    "osm-segment-v2",
+    cachePayload,
+    async () => {
+      // Nominatim + Overpass are only called on a true cache miss.
+      const geo = await resolveRoadBBox(roadName, countryCode);
+      const south = geo.bbox.south;
+      const west = geo.bbox.west;
+      const north = geo.bbox.north;
+      const east = geo.bbox.east;
 
-  let overpassResult: { data: Json; endpoint: string } | null = null;
-  let parsed: ParsedOverpass | null = null;
-  let targetWays: Array<{ id: number; nodes: number[]; tags: Json }> = [];
-  let allHighways: Array<{ id: number; nodes: number[]; tags: Json }> = [];
+      if (![south, west, north, east].every(Number.isFinite)) {
+        throw new Error("Could not resolve a valid bbox");
+      }
 
-  for (let i = 1; i <= 6; i += 1) {
-    iterationCount = i;
-    overpassResult = await fetchOverpassJson(buildOverpassQuery(currentBbox));
-    parsed = parseOverpassData(overpassResult.data);
-    allHighways = parsed.allHighways;
-    targetWays = findTargetWays(allHighways, normRoadName, queryTokens);
+      const normRoadName = normalizeRoadName(roadName);
+      const queryTokens = tokenizeRoadQuery(roadName);
 
-    if (!targetWays.length) {
-      stabilizedReason = i === 1 ? "no_matched_way" : "matched_way_lost";
-      break;
-    }
+      const initialBbox: BBox = { south, west, north, east };
+      let currentBbox: BBox = { ...initialBbox };
+      let stabilizedReason = "max_iterations_reached";
+      let iterationCount = 0;
+      let previousMatchedIds = new Set<number>();
 
-    const matchedIds = new Set(targetWays.map((w) => w.id));
-    if (i > 1 && setEquals(previousMatchedIds, matchedIds)) {
-      stabilizedReason = "matched_ways_stable";
-      break;
-    }
+      let overpassResult: { data: Json; endpoint: string } | null = null;
+      let parsed: ParsedOverpass | null = null;
+      let targetWays: Array<{ id: number; nodes: number[]; tags: Json }> = [];
+      let allHighways: Array<{ id: number; nodes: number[]; tags: Json }> = [];
 
-    const expansion = expandBBoxByConnectivity(currentBbox, targetWays, parsed.nodes, 1.2, 1.2);
-    if (!expansion.changed) {
-      stabilizedReason = expansion.clamped ? "bbox_clamped" : "connectivity_bounds_stable";
-      break;
-    }
+      for (let i = 1; i <= OVERPASS_MAX_ITERATIONS; i += 1) {
+        iterationCount = i;
+        overpassResult = await fetchOverpassJson(buildOverpassQuery(currentBbox));
+        parsed = parseOverpassData(overpassResult.data);
+        allHighways = parsed.allHighways;
+        targetWays = findTargetWays(allHighways, normRoadName, queryTokens);
 
-    previousMatchedIds = matchedIds;
-    currentBbox = expansion.bbox;
+        if (!targetWays.length) {
+          stabilizedReason = i === 1 ? "no_matched_way" : "matched_way_lost";
+          break;
+        }
 
-    if (i === 6) {
-      stabilizedReason = "max_iterations_reached";
-    }
-  }
+        const matchedIds = new Set(targetWays.map((w) => w.id));
+        if (i > 1 && setEquals(previousMatchedIds, matchedIds)) {
+          stabilizedReason = "matched_ways_stable";
+          break;
+        }
 
-  if (!overpassResult || !parsed) {
-    throw new Error("Overpass query failed");
-  }
+        if (i > 1) {
+          const previousCount = previousMatchedIds.size;
+          const currentCount = matchedIds.size;
+          const growthCount = currentCount - previousCount;
+          if (growthCount <= 0) {
+            stabilizedReason = "matched_ways_non_increasing";
+            break;
+          }
+          const growthRatio = growthCount / Math.max(1, previousCount);
+          if (growthRatio < OVERPASS_MIN_GROWTH_RATIO) {
+            stabilizedReason = "matched_ways_growth_below_threshold";
+            break;
+          }
+        }
 
-  const nodes = parsed.nodes;
+        const expansion = expandBBoxByConnectivity(currentBbox, targetWays, parsed.nodes, 0.8, 0.8);
+        if (!expansion.changed) {
+          stabilizedReason = expansion.clamped ? "bbox_clamped" : "connectivity_bounds_stable";
+          break;
+        }
 
-  if (!targetWays.length) {
-    return json({
-      roadName,
-      totalLengthMeters: 0,
-      intersections: [],
-      warning: "找不到符合路段名稱的道路，請確認路段名稱或調整 bbox 範圍。",
-      diagnostics: {
-        endpoint: overpassResult.endpoint,
-        allHighwayWays: allHighways.length,
-        matchedWays: 0,
-        iterations: iterationCount,
-        stabilizedReason,
-        finalBBox: currentBbox,
-      },
-    });
-  }
+        previousMatchedIds = matchedIds;
+        currentBbox = expansion.bbox;
 
-  const nodeUsage = new Map<number, number>();
-  const nodeToWays = new Map<number, number[]>();
+        if (i === OVERPASS_MAX_ITERATIONS) {
+          stabilizedReason = "max_iterations_reached";
+        }
+      }
 
-  for (const w of allHighways) {
-    for (const nid of w.nodes) {
-      nodeUsage.set(nid, (nodeUsage.get(nid) || 0) + 1);
-      const arr = nodeToWays.get(nid) || [];
-      arr.push(w.id);
-      nodeToWays.set(nid, arr);
-    }
-  }
+      if (!overpassResult || !parsed) {
+        throw new Error("Overpass query failed");
+      }
 
-  const wayById = new Map<number, { id: number; nodes: number[]; tags: Json }>();
-  for (const w of allHighways) {
-    wayById.set(w.id, w);
-  }
+      const nodes = parsed.nodes;
+      const targetWayIds = new Set(targetWays.map((way) => way.id));
+      const primaryRoadName = pickPrimaryRoadName(targetWays, roadName);
 
-  const orderedNodeIds = flattenOrderedNodeIds(targetWays);
-  const intersectionsRaw: Array<{ id: number; lat: number; lon: number; name: string; crossStreets: string[]; type: string }> = [];
+      if (!targetWays.length) {
+        return {
+          roadName,
+          totalLengthMeters: 0,
+          intersections: [],
+          warning: "找不到符合路段名稱的道路，請確認路段名稱或調整 bbox 範圍。",
+          diagnostics: {
+            endpoint: overpassResult.endpoint,
+            allHighwayWays: allHighways.length,
+            matchedWays: 0,
+            iterations: iterationCount,
+            stabilizedReason,
+            finalBBox: currentBbox,
+          },
+        } as Json;
+      }
 
-  for (let i = 0; i < orderedNodeIds.length; i += 1) {
-    const nid = orderedNodeIds[i];
-    const node = nodes.get(nid);
-    if (!node) {
-      continue;
-    }
+      const nodeUsage = new Map<number, number>();
+      const nodeToWays = new Map<number, number[]>();
 
-    const usage = nodeUsage.get(nid) || 0;
-    if (usage <= 1) {
-      continue;
-    }
+      for (const w of allHighways) {
+        for (const nid of w.nodes) {
+          nodeUsage.set(nid, (nodeUsage.get(nid) || 0) + 1);
+          const arr = nodeToWays.get(nid) || [];
+          arr.push(w.id);
+          nodeToWays.set(nid, arr);
+        }
+      }
 
-    const linkedWays = [...new Set(nodeToWays.get(nid) || [])]
-      .map((id) => wayById.get(id))
-      .filter(Boolean) as Array<{ id: number; nodes: number[]; tags: Json }>;
+      const wayById = new Map<number, { id: number; nodes: number[]; tags: Json }>();
+      for (const w of allHighways) {
+        wayById.set(w.id, w);
+      }
 
-    const crossNames = linkedWays
-      .map((w) => String(w.tags["name:zh"] || w.tags.name || ""))
-      .map((n) => n.trim())
-      .filter((n) => n && normalizeRoadName(n) !== normRoadName);
+      const orderedNodeIds = flattenOrderedNodeIds(targetWays);
+      const intersectionsRaw: Array<{
+        id: number;
+        lat: number;
+        lon: number;
+        name: string;
+        crossStreets: string[];
+        type: string;
+        crossBearingOptions: Array<{ roadName: string; bearing: number }>;
+      }> = [];
 
-    const uniqueCross = [...new Set(crossNames)];
-    const baseName = String(node.tags["name:zh"] || node.tags.name || "").trim();
-    const intersectionName =
-      baseName || `${roadName} × ${uniqueCross[0] || "未命名道路"}`;
+      for (let i = 0; i < orderedNodeIds.length; i += 1) {
+        const nid = orderedNodeIds[i];
+        const node = nodes.get(nid);
+        if (!node) {
+          continue;
+        }
 
-    intersectionsRaw.push({
-      id: nid,
-      lat: node.lat,
-      lon: node.lon,
-      name: intersectionName,
-      crossStreets: uniqueCross,
-      type: classifyIntersection(linkedWays.length),
-    });
-  }
+        const usage = nodeUsage.get(nid) || 0;
+        if (usage <= 1) {
+          continue;
+        }
 
-  const unique = dedupeIntersections(intersectionsRaw);
-  const intersections = unique.map((cur, index) => {
-    const next = unique[index + 1];
-    if (!next) {
+        const linkedWays = [...new Set(nodeToWays.get(nid) || [])]
+          .map((id) => wayById.get(id))
+          .filter(Boolean) as Array<{ id: number; nodes: number[]; tags: Json }>;
+
+        const crossNames = linkedWays
+          .filter((w) => !targetWayIds.has(w.id) && shouldIncludeIntersectionCrossWay(w))
+          .map((w) => String(w.tags["name:zh"] || w.tags.name || ""))
+          .map((n) => n.trim())
+          .filter((n) => n && normalizeRoadName(n) !== normalizeRoadName(primaryRoadName));
+
+        const crossBearingOptions = linkedWays
+          .filter((w) => !targetWayIds.has(w.id) && shouldIncludeIntersectionCrossWay(w))
+          .flatMap((w) => {
+            const roadName = String(w.tags["name:zh"] || w.tags.name || "").trim();
+            if (!roadName || normalizeRoadName(roadName) === normalizeRoadName(primaryRoadName)) {
+              return [];
+            }
+            return getWayDepartureBearings(w, nid, nodes).map((bearing) => ({ roadName, bearing }));
+          });
+
+        const uniqueCross = [...new Set(crossNames)];
+        const baseName = String(node.tags["name:zh"] || node.tags.name || "").trim();
+        const intersectionName =
+          baseName || `${primaryRoadName} × ${uniqueCross[0] || "未命名道路"}`;
+
+        intersectionsRaw.push({
+          id: nid,
+          lat: node.lat,
+          lon: node.lon,
+          name: intersectionName,
+          crossStreets: uniqueCross,
+          type: classifyIntersection(linkedWays.length),
+          crossBearingOptions,
+        });
+      }
+
+      const unique = dedupeIntersections(intersectionsRaw);
+      const intersections = unique.map((cur, index) => {
+        const prev = unique[index - 1];
+        const next = unique[index + 1];
+        const forwardBearing = next
+          ? bearingDegrees(cur, next)
+          : prev
+            ? normalizeHeading(bearingDegrees(prev, cur))
+            : null;
+        const turnCandidates = resolveTurnCandidates(cur.crossBearingOptions, forwardBearing);
+
+        if (!next) {
+          return {
+            ...cur,
+            bearingToNext: null,
+            directionToNext: null,
+            distanceToNext: 0,
+            leftTurn: turnCandidates.left,
+            rightTurn: turnCandidates.right,
+          };
+        }
+
+        const bearing = bearingDegrees(cur, next);
+        return {
+          ...cur,
+          bearingToNext: Math.round(bearing),
+          directionToNext: headingLabel(bearing),
+          distanceToNext: Math.round(haversineMeters(cur, next)),
+          leftTurn: turnCandidates.left,
+          rightTurn: turnCandidates.right,
+        };
+      });
+
+      let totalLengthMeters = 0;
+      for (let i = 0; i < intersections.length - 1; i += 1) {
+        totalLengthMeters += Number(intersections[i].distanceToNext || 0);
+      }
+
+      const warning = intersections.length === 0
+        ? "Overpass 有回傳道路資料，但目前條件下沒有可辨識路口。請放大 bbox 或改用更完整路段名稱。"
+        : null;
+
       return {
-        ...cur,
-        bearingToNext: null,
-        directionToNext: null,
-        distanceToNext: 0,
-      };
-    }
-
-    const bearing = bearingDegrees(cur, next);
-    return {
-      ...cur,
-      bearingToNext: Math.round(bearing),
-      directionToNext: headingLabel(bearing),
-      distanceToNext: Math.round(haversineMeters(cur, next)),
-    };
-  });
-
-  let totalLengthMeters = 0;
-  for (let i = 0; i < intersections.length - 1; i += 1) {
-    totalLengthMeters += Number(intersections[i].distanceToNext || 0);
-  }
-
-  const warning = intersections.length === 0
-    ? "Overpass 有回傳道路資料，但目前條件下沒有可辨識路口。請放大 bbox 或改用更完整路段名稱。"
-    : null;
-
-  return json({
-    roadName,
-    totalLengthMeters,
-    intersections,
-    warning,
-    diagnostics: {
-      endpoint: overpassResult.endpoint,
-      allHighwayWays: allHighways.length,
-      matchedWays: targetWays.length,
-      rawElements: parsed.elements.length,
-      iterations: iterationCount,
-      stabilizedReason,
-      initialBBox: initialBbox,
-      finalBBox: currentBbox,
+        roadName: primaryRoadName,
+        queryRoadName: roadName,
+        totalLengthMeters,
+        intersections: intersections.map((row) => ({
+          ...row,
+          addressLabel: null,
+          addressSource: null,
+        })),
+        warning,
+        diagnostics: {
+          endpoint: overpassResult.endpoint,
+          allHighwayWays: allHighways.length,
+          matchedWays: targetWays.length,
+          rawElements: parsed.elements.length,
+          iterations: iterationCount,
+          stabilizedReason,
+          initialBBox: initialBbox,
+          finalBBox: currentBbox,
+        },
+      } as Json;
     },
-  });
+    OSM_CACHE_TTL_SECONDS,
+    {
+      ctx,
+      staleWhileRevalidateSeconds: OSM_CACHE_STALE_SECONDS,
+    },
+  );
+
+  return json(cached.data);
 }
 
 async function fetchOverpassJson(query: string): Promise<{ data: Json; endpoint: string }> {
-  const endpoints = [
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass-api.de/api/interpreter",
-  ];
+  return fetchOverpassJsonWithEndpoints(
+    query,
+    [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.openstreetmap.fr/api/interpreter",
+    ],
+    OVERPASS_TIMEOUT_MS,
+  );
+}
 
+async function fetchOverpassPlaceJson(query: string): Promise<{ data: Json; endpoint: string }> {
+  return fetchOverpassJsonWithEndpoints(
+    query,
+    [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.openstreetmap.fr/api/interpreter",
+    ],
+    OVERPASS_PLACE_TIMEOUT_MS,
+  );
+}
+
+async function fetchOverpassJsonWithEndpoints(
+  query: string,
+  endpoints: string[],
+  timeoutMs: number,
+): Promise<{ data: Json; endpoint: string }> {
   let lastStatus = 0;
   for (const base of endpoints) {
     const url = `${base}?data=${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        accept: "application/json",
-        "user-agent": "AlaViaBlindMap/0.1 (contact: yoofun@gmail.com)",
-      },
-    });
-    lastStatus = res.status;
-    if (res.ok) {
-      return {
-        data: (await res.json()) as Json,
-        endpoint: base,
-      };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort("overpass-timeout"), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          accept: "application/json",
+          "user-agent": "AlaViaBlindMap/0.1 (contact: yoofun@gmail.com)",
+        },
+      });
+      lastStatus = res.status;
+      if (res.ok) {
+        return {
+          data: (await res.json()) as Json,
+          endpoint: base,
+        };
+      }
+    } catch {
+      lastStatus = 598;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
   throw new Error(`Overpass error: ${lastStatus}`);
 }
 
+async function fetchNominatimReverse(env: Env, lat: number, lon: number, ctx?: ExecutionContext): Promise<Json> {
+  const payload = { lat: round6(lat), lon: round6(lon) };
+  const cached = await getOrCreateCached(
+    env,
+    "geocode-reverse-v2",
+    payload,
+    async () => {
+      const p = new URLSearchParams({
+        lat: String(payload.lat),
+        lon: String(payload.lon),
+        format: "jsonv2",
+        addressdetails: "1",
+        zoom: "18",
+      });
+
+      const url = `https://nominatim.openstreetmap.org/reverse?${p.toString()}`;
+      const res = await fetchWithTimeout(url, {
+        method: "GET",
+        headers: {
+          accept: "application/json",
+          "user-agent": "AlaViaBlindMap/0.1 (contact: yoofun@gmail.com)",
+        },
+      });
+      if (!res.ok) {
+        throw new Error(`Reverse geocode error: ${res.status}`);
+      }
+
+      return (await res.json()) as Json;
+    },
+    TTL_365_DAYS,
+    {
+      ctx,
+      staleWhileRevalidateSeconds: 30 * DAY,
+    },
+  );
+
+  return cached.data;
+}
+
+async function handleOsmRoutePlaces(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const start = body.start as Json;
+  const end = body.end as Json;
+  const roadName = String(body.roadName || "").trim();
+
+  const startPoint = { lat: Number(start.lat), lon: Number(start.lon) };
+  const endPoint = { lat: Number(end.lat), lon: Number(end.lon) };
+
+  if (![startPoint.lat, startPoint.lon, endPoint.lat, endPoint.lon].every(Number.isFinite)) {
+    throw new Error("start and end coordinates are required");
+  }
+
+  const canonicalSegment = canonicalizeRouteSegment(startPoint, endPoint);
+
+  await ensureD1Schema(env);
+  const cachePayload = {
+    roadName: normalizeRoadName(roadName),
+    start: { lat: canonicalSegment.start.lat, lon: canonicalSegment.start.lon },
+    end: { lat: canonicalSegment.end.lat, lon: canonicalSegment.end.lon },
+    version: 3,
+  };
+
+  const cached = await getOrCreateCached(
+    env,
+    "osm-route-places-v2",
+    cachePayload,
+    async () => {
+      const bbox = expandBBoxAroundSegment(canonicalSegment.start, canonicalSegment.end, 38);
+      const overpassResult = await fetchOverpassPlaceJson(buildOsmBBoxPlaceQuery(bbox));
+      const segmentLength = haversineMeters(canonicalSegment.start, canonicalSegment.end);
+      const maxOffset = Math.max(30, Math.min(60, segmentLength / 3));
+
+      const candidates = dedupeOsmPlaces(
+        parseOsmPlaceCandidates(overpassResult.data).map((place) => {
+          const projection = projectPointToSegmentMeters(canonicalSegment.start, canonicalSegment.end, place);
+          return {
+            ...place,
+            distanceMeters: Math.round(projection.alongMeters),
+            sortMeters: Math.round(projection.alongMeters),
+            distanceToLineMeters: Math.round(projection.distanceToLineMeters),
+            onTargetRoad: roadName ? isTargetRoadPlace(place.streetName, roadName) : place.onTargetRoad,
+          };
+        }),
+      ).filter((place) => place.distanceToLineMeters <= maxOffset);
+
+      const places = prioritizeRoutePlaces(candidates).slice(0, 16);
+      const osmAssessment = assessOsmCoverage(places, candidates);
+
+      const lines = places.length
+        ? places.map((place) => `${Math.max(0, place.sortMeters)}m：${formatOsmPlaceLine(place, false)}`)
+        : ["未找到可排序的沿街樓宇/地點，可能是此段 OSM 門牌或名稱資料不足。"];
+
+      const notes = [
+        `OSM 篩選：主路門牌 ${osmAssessment.onRoadAddressCount} 個，主路命名地點 ${osmAssessment.onRoadNamedCount} 個，旁支候選已收斂。`,
+      ];
+
+      const text = [
+        `沿街 OSM 地點整理完成，共 ${places.length} 個候選點。`,
+        `來源：${overpassResult.endpoint}`,
+        ...notes,
+        "",
+        ...lines,
+      ].join("\n");
+
+      return {
+        ok: true,
+        provider: "osm-route-places",
+        endpoint: overpassResult.endpoint,
+        count: places.length,
+        googleFallbackCount: 0,
+        googleFallbackReason: null,
+        text,
+        places,
+        googlePlaces: [],
+      } as Json;
+    },
+    OSM_CACHE_TTL_SECONDS,
+    {
+      ctx,
+      staleWhileRevalidateSeconds: OSM_CACHE_STALE_SECONDS,
+    },
+  );
+
+  return json(adaptOsmRoutePlacesForDirection(cached.data, canonicalSegment));
+}
+
+function canonicalizeRouteSegment(
+  start: { lat: number; lon: number },
+  end: { lat: number; lon: number },
+): { start: { lat: number; lon: number }; end: { lat: number; lon: number }; reversed: boolean } {
+  const a = { lat: round4(start.lat), lon: round4(start.lon) };
+  const b = { lat: round4(end.lat), lon: round4(end.lon) };
+  const keepOrder = a.lat < b.lat || (a.lat === b.lat && a.lon <= b.lon);
+  return keepOrder
+    ? { start: a, end: b, reversed: false }
+    : { start: b, end: a, reversed: true };
+}
+
+function adaptOsmRoutePlacesForDirection(
+  data: Json,
+  segment: { start: { lat: number; lon: number }; end: { lat: number; lon: number }; reversed: boolean },
+): Json {
+  if (!segment.reversed) {
+    return data;
+  }
+
+  const basePlaces = Array.isArray(data.places) ? (data.places as Json[]) : [];
+  const segmentMeters = Math.max(0, Math.round(haversineMeters(segment.start, segment.end)));
+  const remapped = basePlaces
+    .map((raw) => {
+      const place = { ...raw } as Json;
+      const oldSort = Number(place.sortMeters || 0);
+      const mappedSort = Math.max(0, Math.min(segmentMeters, segmentMeters - oldSort));
+      place.sortMeters = mappedSort;
+      place.distanceMeters = mappedSort;
+      return place;
+    })
+    .sort((a, b) => Number(a.sortMeters || 0) - Number(b.sortMeters || 0));
+
+  const routeLines = remapped.length
+    ? remapped.map((place) => {
+        const sortMeters = Math.max(0, Number(place.sortMeters || 0));
+        return `${Math.round(sortMeters)}m：${formatOsmPlaceLine(place as OsmPlaceCandidate, false)}`;
+      })
+    : ["未找到可排序的沿街樓宇/地點，可能是此段 OSM 門牌或名稱資料不足。"];
+
+  const endpoint = String(data.endpoint || "");
+  const text = [
+    `沿街 OSM 地點整理完成，共 ${remapped.length} 個候選點。`,
+    endpoint ? `來源：${endpoint}` : "",
+    "",
+    ...routeLines,
+  ].filter(Boolean).join("\n");
+
+  return {
+    ...data,
+    count: remapped.length,
+    places: remapped,
+    text,
+  } as Json;
+}
+
+async function handleGoogleRoutePlaces(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  await requireClerkAuth(request, env);
+  await ensureD1Schema(env);
+  const body = await requireJson(request);
+  requireUserConfirmedPaidCall(body);
+
+  const start = body.start as Json;
+  const end = body.end as Json;
+  const roadName = String(body.roadName || "").trim();
+  const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
+
+  const startPoint = { lat: Number(start.lat), lon: Number(start.lon) };
+  const endPoint = { lat: Number(end.lat), lon: Number(end.lon) };
+  if (![startPoint.lat, startPoint.lon, endPoint.lat, endPoint.lon].every(Number.isFinite)) {
+    throw new Error("start and end coordinates are required");
+  }
+
+  const cachePayload = {
+    roadName: normalizeRoadName(roadName),
+    language,
+    start: { lat: round5(startPoint.lat), lon: round5(startPoint.lon) },
+    end: { lat: round5(endPoint.lat), lon: round5(endPoint.lon) },
+    version: 1,
+  };
+
+  const cached = await getOrCreateCached(
+    env,
+    "google-route-places-v1",
+    cachePayload,
+    async () => {
+      const places = await fetchGooglePlacesAlongSegment(env, startPoint, endPoint, roadName, language);
+      const lines = places.length
+        ? places.map((place) => `${Math.max(0, place.sortMeters)}m：${formatGoogleRoutePlaceLine(place)}`)
+        : ["此段未找到 Google Places 地點。"];
+
+      return {
+        ok: true,
+        provider: "google-route-places",
+        count: places.length,
+        text: [
+          `沿街 Google Places 整理完成，共 ${places.length} 個候選點。`,
+          ...lines,
+        ].join("\n"),
+        places,
+      } as Json;
+    },
+    TTL_365_DAYS,
+    {
+      ctx,
+      staleWhileRevalidateSeconds: 30 * DAY,
+    },
+  );
+
+  return json(cached.data);
+}
+
+async function handleIntersectionAddressBatch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const roadName = String(body.roadName || "").trim();
+  const pointsRaw = Array.isArray(body.points) ? (body.points as Json[]) : [];
+  const maxItems = Math.max(1, Math.min(20, Number(body.maxItems ?? 8)));
+
+  const points = pointsRaw
+    .slice(0, maxItems)
+    .map((item, idx) => ({
+      idx: Number(item.idx ?? idx),
+      id: Number(item.id),
+      lat: Number(item.lat),
+      lon: Number(item.lon),
+    }))
+    .filter((p) => Number.isFinite(p.id) && Number.isFinite(p.lat) && Number.isFinite(p.lon));
+
+  const rows = await Promise.all(
+    points.map(async (point) => {
+      try {
+        const reverse = await fetchNominatimReverse(env, point.lat, point.lon, ctx);
+        const address = buildIntersectionAddressLabel(reverse, roadName);
+        return {
+          idx: point.idx,
+          id: point.id,
+          addressLabel: address.label,
+          addressSource: address.source,
+        };
+      } catch {
+        return {
+          idx: point.idx,
+          id: point.id,
+          addressLabel: null,
+          addressSource: null,
+        };
+      }
+    }),
+  );
+
+  return json({
+    ok: true,
+    count: rows.length,
+    rows,
+  });
+}
+
+async function enrichIntersectionsWithAddresses(
+  env: Env,
+  ctx: ExecutionContext,
+  intersections: Array<Omit<IntersectionRow, "addressLabel" | "addressSource">>,
+  roadName: string,
+): Promise<IntersectionRow[]> {
+  return Promise.all(
+    intersections.map(async (row, index) => {
+      try {
+        const sample = chooseIntersectionAddressSample(intersections, index);
+        const reverse = await fetchNominatimReverse(env, sample.lat, sample.lon, ctx);
+        const address = buildIntersectionAddressLabel(reverse, roadName);
+        return {
+          ...row,
+          addressLabel: address.label,
+          addressSource: address.source,
+        };
+      } catch {
+        return {
+          ...row,
+          addressLabel: null,
+          addressSource: null,
+        };
+      }
+    }),
+  );
+}
+
+function chooseIntersectionAddressSample(
+  intersections: Array<{ lat: number; lon: number }>,
+  index: number,
+): { lat: number; lon: number } {
+  const current = intersections[index];
+  const anchor = intersections[index + 1] || intersections[index - 1];
+  if (!current || !anchor) {
+    return current;
+  }
+
+  const distance = haversineMeters(current, anchor);
+  if (!Number.isFinite(distance) || distance <= 1) {
+    return current;
+  }
+
+  const meters = Math.min(18, distance * 0.35);
+  const ratio = meters / distance;
+  return {
+    lat: current.lat + (anchor.lat - current.lat) * ratio,
+    lon: current.lon + (anchor.lon - current.lon) * ratio,
+  };
+}
+
+function buildIntersectionAddressLabel(reverse: Json, roadName: string): { label: string | null; source: string | null } {
+  const address = (reverse.address || {}) as Json;
+  const streetName = String(
+    address.road || address.pedestrian || address.residential || address.footway || address.cycleway || address.path || "",
+  ).trim();
+  const houseNumber = String(address.house_number || "").trim();
+  const houseName = String(address.house_name || "").trim();
+  const exact = formatStreetAddress(streetName, houseNumber, houseName);
+  const onTargetRoad = exact && streetName ? isTargetRoadPlace(streetName, roadName) : false;
+
+  if (onTargetRoad && exact) {
+    return { label: exact, source: "on-road" };
+  }
+  if (exact) {
+    return { label: exact, source: "nearby" };
+  }
+
+  return { label: null, source: null };
+}
+
+function buildOsmAroundPlaceQuery(lat: number, lon: number, radius: number): string {
+  return `
+[out:json][timeout:25];
+(
+${buildOsmPlaceStatements(`(around:${Math.round(radius)},${lat},${lon})`)}
+);
+out center tags;
+`;
+}
+
+function buildOsmBBoxPlaceQuery(bbox: BBox): string {
+  return `
+[out:json][timeout:25];
+(
+${buildOsmPlaceStatements(`(${bbox.south},${bbox.west},${bbox.north},${bbox.east})`)}
+);
+out center tags;
+`;
+}
+
+function buildOsmPlaceStatements(selector: string): string {
+  const lines: string[] = [];
+
+  // Keep queries selective to reduce Overpass payload.
+  for (const elementType of ["node", "way"]) {
+    lines.push(`  ${elementType}["amenity"]["name"]${selector};`);
+    lines.push(`  ${elementType}["shop"]["name"]${selector};`);
+    lines.push(`  ${elementType}["tourism"]["name"]${selector};`);
+    lines.push(`  ${elementType}["office"]["name"]${selector};`);
+    lines.push(`  ${elementType}["addr:housenumber"]["addr:street"]${selector};`);
+    lines.push(`  ${elementType}["addr:housenumber"]["addr:place"]${selector};`);
+  }
+
+  // Transit: bus stops, tram, MTR / subway entrances, platforms
+  lines.push(`  node["highway"="bus_stop"]${selector};`);
+  lines.push(`  node["public_transport"~"platform|stop_position"]${selector};`);
+  lines.push(`  way["public_transport"~"platform"]${selector};`);
+  lines.push(`  node["railway"~"station|halt|tram_stop|subway_entrance"]${selector};`);
+  lines.push(`  way["railway"~"station|halt|tram_stop"]${selector};`);
+
+  // Entrances and pedestrian crossings
+  lines.push(`  node["entrance"]${selector};`);
+  lines.push(`  node["highway"="crossing"]${selector};`);
+
+  // Named buildings (ways only; nodes already covered by name tag above)
+  lines.push(`  way["building"]["name"]${selector};`);
+
+  // High-value named leisure landmarks
+  lines.push(`  node["leisure"~"park|playground|sports_centre|stadium|swimming_pool|garden"]["name"]${selector};`);
+  lines.push(`  way["leisure"~"park|playground|sports_centre|stadium|swimming_pool|garden"]["name"]${selector};`);
+
+  // High-value named landuse areas
+  lines.push(`  way["landuse"~"retail|commercial|industrial|cemetery|recreation_ground"]["name"]${selector};`);
+
+  return lines.join("\n");
+}
+
+function parseOsmPlaceCandidates(overpass: Json): OsmPlaceCandidate[] {
+  const elements = Array.isArray(overpass.elements) ? (overpass.elements as Json[]) : [];
+  const rows: OsmPlaceCandidate[] = [];
+
+  for (const element of elements) {
+    const row = buildOsmPlaceCandidate(element);
+    if (row) {
+      rows.push(row);
+    }
+  }
+
+  return rows;
+}
+
+function buildOsmPlaceCandidate(element: Json): OsmPlaceCandidate | null {
+  const type = String(element.type || "").trim();
+  const center = (element.center || {}) as Json;
+  const tags = (element.tags || {}) as Json;
+  const lat = type === "node" ? Number(element.lat) : Number(center.lat);
+  const lon = type === "node" ? Number(element.lon) : Number(center.lon);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return null;
+  }
+
+  const highwayVal = String(tags.highway || "").trim();
+  if (highwayVal && highwayVal !== "bus_stop" && highwayVal !== "crossing") {
+    return null;
+  }
+  const streetName = String(tags["addr:street"] || tags["addr:place"] || "").trim() || null;
+  const houseNumber = String(tags["addr:housenumber"] || "").trim();
+  const houseName = String(tags["addr:housename"] || "").trim();
+  const addressLabel = formatStreetAddress(streetName, houseNumber, houseName);
+  const explicitName = String(tags["name:zh"] || tags.name || tags.brand || tags.operator || tags.ref || "").trim();
+  const kindLabel = describeOsmKind(tags);
+  const hasSpecificFeature = Boolean(
+    tags.amenity || tags.shop || tags.tourism || tags.office ||
+    tags.railway || tags.public_transport || tags.entrance ||
+    highwayVal === "bus_stop" || highwayVal === "crossing" ||
+    tags.leisure || tags.landuse
+  );
+  const title = explicitName || addressLabel || (hasSpecificFeature ? kindLabel : null);
+
+  if (!title) {
+    return null;
+  }
+
+  return {
+    id: `${type}:${String(element.id || "")}`,
+    lat,
+    lon,
+    title,
+    addressLabel,
+    kindLabel,
+    streetName,
+    distanceMeters: 0,
+    sortMeters: 0,
+    distanceToLineMeters: 0,
+    onTargetRoad: false,
+    hasHouseNumber: Boolean(houseNumber),
+    hasExplicitName: Boolean(explicitName),
+    hasFeatureTag: hasSpecificFeature,
+  };
+}
+
+function shouldIncludeIntersectionCrossWay(way: { tags: Json }): boolean {
+  const highway = String(way.tags.highway || "").trim().toLowerCase();
+  if (!highway) {
+    return false;
+  }
+  return highway !== "footway" && highway !== "path" && highway !== "steps";
+}
+
+function dedupeOsmPlaces(places: OsmPlaceCandidate[]): OsmPlaceCandidate[] {
+  const seen = new Set<string>();
+  const out: OsmPlaceCandidate[] = [];
+
+  for (const place of places) {
+    const key = [
+      normalizeRoadName(place.title),
+      normalizeRoadName(place.addressLabel || ""),
+      Math.round(place.lat * 10000),
+      Math.round(place.lon * 10000),
+    ].join("|");
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(place);
+  }
+
+  return out;
+}
+
+function prioritizeRoutePlaces(candidates: OsmPlaceCandidate[]): OsmPlaceCandidate[] {
+  const sorted = [...candidates].sort((a, b) => a.sortMeters - b.sortMeters || a.distanceToLineMeters - b.distanceToLineMeters);
+  const filtered: OsmPlaceCandidate[] = [];
+  const onRoadPool = sorted.filter((place) => place.onTargetRoad);
+  const hasEnoughOnRoad = onRoadPool.length >= 5;
+  const hasEnoughOnRoadAddresses = onRoadPool.filter((place) => place.hasHouseNumber).length >= 3;
+
+  for (const place of sorted) {
+    if (place.onTargetRoad) {
+      filtered.push(place);
+      continue;
+    }
+
+    if (hasEnoughOnRoadAddresses) {
+      continue;
+    }
+
+    if (hasEnoughOnRoad && place.distanceToLineMeters > 12) {
+      continue;
+    }
+
+    if (!place.hasHouseNumber && !place.hasExplicitName) {
+      continue;
+    }
+
+    const nearbyOnRoad = filtered.some(
+      (kept) => kept.onTargetRoad && Math.abs(kept.sortMeters - place.sortMeters) <= 35,
+    );
+    if (nearbyOnRoad && place.distanceToLineMeters > 10) {
+      continue;
+    }
+
+    filtered.push(place);
+  }
+
+  return filtered.sort((a, b) => {
+    const aBand = routePlaceBand(a);
+    const bBand = routePlaceBand(b);
+    return aBand - bBand || a.sortMeters - b.sortMeters || a.distanceToLineMeters - b.distanceToLineMeters;
+  });
+}
+
+function routePlaceBand(place: OsmPlaceCandidate): number {
+  if (place.onTargetRoad && place.hasHouseNumber) {
+    return 0;
+  }
+  if (place.onTargetRoad && (place.hasExplicitName || place.hasFeatureTag)) {
+    return 1;
+  }
+  if (place.onTargetRoad) {
+    return 2;
+  }
+  if (place.hasHouseNumber) {
+    return 3;
+  }
+  return 4;
+}
+
+function assessOsmCoverage(selected: OsmPlaceCandidate[], allCandidates: OsmPlaceCandidate[]): OsmCoverageAssessment {
+  const onRoadAddressCount = selected.filter((place) => place.onTargetRoad && place.hasHouseNumber).length;
+  const onRoadNamedCount = selected.filter((place) => place.onTargetRoad && place.hasExplicitName).length;
+  const unnamedCommercialCount = allCandidates.filter(
+    (place) => place.onTargetRoad && place.hasFeatureTag && !place.hasExplicitName,
+  ).length;
+  const likelyCommercialUnnamed = unnamedCommercialCount >= 4 && onRoadNamedCount === 0;
+
+  if (selected.length < 3) {
+    return {
+      onRoadAddressCount,
+      onRoadNamedCount,
+      totalCount: selected.length,
+      likelyCommercialUnnamed,
+      shouldFallback: true,
+      reason: "OSM 候選點少於 3 個",
+    };
+  }
+
+  if (onRoadAddressCount === 0) {
+    return {
+      onRoadAddressCount,
+      onRoadNamedCount,
+      totalCount: selected.length,
+      likelyCommercialUnnamed,
+      shouldFallback: true,
+      reason: "OSM 缺少目標道路門牌",
+    };
+  }
+
+  if (likelyCommercialUnnamed) {
+    return {
+      onRoadAddressCount,
+      onRoadNamedCount,
+      totalCount: selected.length,
+      likelyCommercialUnnamed,
+      shouldFallback: true,
+      reason: "疑似商業街但缺少店名",
+    };
+  }
+
+  return {
+    onRoadAddressCount,
+    onRoadNamedCount,
+    totalCount: selected.length,
+    likelyCommercialUnnamed,
+    shouldFallback: false,
+    reason: "OSM 資料足夠",
+  };
+}
+
+function shouldUseGooglePlacesFallback(assessment: OsmCoverageAssessment): boolean {
+  return assessment.shouldFallback;
+}
+
+async function fetchGooglePlacesAlongSegment(
+  env: Env,
+  start: { lat: number; lon: number },
+  end: { lat: number; lon: number },
+  roadName: string,
+  language: string,
+): Promise<GoogleRoutePlaceCandidate[]> {
+  const apiKey = requireGoogleMapsKey(env);
+  const samplePoints = buildGoogleFallbackSamplePoints(start, end);
+  const results: GoogleRoutePlaceCandidate[] = [];
+
+  for (let i = 0; i < samplePoints.length; i += 1) {
+    const point = samplePoints[i];
+    const places = await fetchGooglePlaces(apiKey, round6(point.lat), round6(point.lon), 35, language);
+    const list = Array.isArray(places.places) ? (places.places as Json[]) : [];
+
+    for (const item of list) {
+      const candidate = buildGoogleRoutePlaceCandidate(item, start, end, roadName);
+      if (candidate) {
+        results.push(candidate);
+      }
+    }
+  }
+
+  return dedupeGoogleRoutePlaces(results)
+    .filter((place) => place.distanceToLineMeters <= 22)
+    .sort((a, b) => a.sortMeters - b.sortMeters || a.distanceToLineMeters - b.distanceToLineMeters)
+    .slice(0, 8);
+}
+
+function buildGoogleFallbackSamplePoints(
+  start: { lat: number; lon: number },
+  end: { lat: number; lon: number },
+): Array<{ lat: number; lon: number }> {
+  const total = haversineMeters(start, end);
+  const segments = total < 80 ? [0.5] : total < 180 ? [0.25, 0.75] : [0.15, 0.5, 0.85];
+  return segments.map((t) => ({
+    lat: start.lat + (end.lat - start.lat) * t,
+    lon: start.lon + (end.lon - start.lon) * t,
+  }));
+}
+
+function buildGoogleRoutePlaceCandidate(
+  item: Json,
+  start: { lat: number; lon: number },
+  end: { lat: number; lon: number },
+  roadName: string,
+): GoogleRoutePlaceCandidate | null {
+  const location = (item.location || {}) as Json;
+  const lat = Number(location.latitude);
+  const lon = Number(location.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return null;
+  }
+
+  const displayName = (item.displayName || {}) as Json;
+  const title = String(displayName.text || "").trim();
+  if (!title) {
+    return null;
+  }
+
+  const types = Array.isArray(item.types) ? (item.types as string[]) : [];
+  const vicinity = String(item.formattedAddress || "").trim() || null;
+  const streetName = extractGoogleStreetName(vicinity);
+  if (roadName && streetName && !isTargetRoadPlace(streetName, roadName)) {
+    return null;
+  }
+
+  const projection = projectPointToSegmentMeters(start, end, { lat, lon });
+  return {
+    id: `${normalizeRoadName(title)}:${round5(lat)}:${round5(lon)}`,
+    title,
+    typeLabel: types.length ? types.slice(0, 2).join("/") : null,
+    addressLabel: vicinity,
+    lat,
+    lon,
+    sortMeters: Math.round(projection.alongMeters),
+    distanceToLineMeters: Math.round(projection.distanceToLineMeters),
+  };
+}
+
+function extractGoogleStreetName(vicinity: string | null): string | null {
+  if (!vicinity) {
+    return null;
+  }
+  const first = vicinity.split(",")[0]?.trim() || "";
+  return first || null;
+}
+
+function dedupeGoogleRoutePlaces(places: GoogleRoutePlaceCandidate[]): GoogleRoutePlaceCandidate[] {
+  const seen = new Set<string>();
+  const out: GoogleRoutePlaceCandidate[] = [];
+
+  for (const place of places) {
+    const key = [normalizeRoadName(place.title), Math.round(place.lat * 10000), Math.round(place.lon * 10000)].join("|");
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(place);
+  }
+
+  return out;
+}
+
+function formatGoogleRoutePlaceLine(place: GoogleRoutePlaceCandidate): string {
+  const parts = [place.title];
+  if (place.addressLabel) {
+    parts.push(place.addressLabel);
+  }
+  if (place.typeLabel) {
+    parts.push(place.typeLabel);
+  }
+  return parts.join("，");
+}
+
+function formatOsmPlaceLine(place: OsmPlaceCandidate, includeDistance: boolean): string {
+  const parts = [place.title];
+  if (place.addressLabel && place.addressLabel !== place.title) {
+    parts.push(place.addressLabel);
+  }
+  if (place.kindLabel && place.kindLabel !== place.title) {
+    parts.push(place.kindLabel);
+  }
+  if (includeDistance) {
+    parts.push(`${place.distanceMeters}m`);
+  }
+  return parts.filter(Boolean).join("，");
+}
+
+function formatStreetAddress(streetName: string | null, houseNumber: string, houseName: string): string | null {
+  const parts = [streetName || "", houseNumber].filter(Boolean);
+  const base = parts.join(" ").trim();
+  if (houseName && houseName !== base) {
+    return base ? `${base}，${houseName}` : houseName;
+  }
+  return base || null;
+}
+
+function describeOsmKind(tags: Json): string | null {
+  // Transit: highway values
+  const highwayVal = String(tags.highway || "").trim();
+  if (highwayVal === "bus_stop") return "巴士站";
+  if (highwayVal === "crossing") return "行人過路";
+
+  // Transit: railway values
+  const railwayVal = String(tags.railway || "").trim();
+  if (railwayVal === "tram_stop") return "電車站";
+  if (railwayVal === "subway_entrance") return "港鐵出入口";
+  if (railwayVal === "station") return "鐵路站";
+  if (railwayVal === "halt") return "車站";
+
+  // Transit: public_transport
+  const ptVal = String(tags.public_transport || "").trim();
+  if (ptVal === "platform") return "月台";
+  if (ptVal === "stop_position") return "站";
+
+  // Entrance
+  const entranceVal = String(tags.entrance || "").trim();
+  if (entranceVal && entranceVal !== "no") return "入口";
+
+  // Leisure landmarks
+  const leisureVal = String(tags.leisure || "").trim();
+  const leisureLabels: Record<string, string> = {
+    park: "公園",
+    playground: "遊樂場",
+    sports_centre: "體育中心",
+    stadium: "體育場",
+    swimming_pool: "游泳池",
+    garden: "花園",
+  };
+  if (leisureVal) return leisureLabels[leisureVal] ?? leisureVal.replaceAll("_", " ");
+
+  // Landuse areas
+  const landuseVal = String(tags.landuse || "").trim();
+  const landuseLabels: Record<string, string> = {
+    retail: "商業區",
+    commercial: "商業區",
+    industrial: "工業區",
+    cemetery: "墳場",
+    recreation_ground: "休憩用地",
+  };
+  if (landuseVal) return landuseLabels[landuseVal] ?? null;
+
+  // Amenity / shop / tourism / office / building
+  const raw = String(tags.amenity || tags.shop || tags.tourism || tags.office || tags.building || "").trim();
+  if (!raw || raw === "yes") {
+    return null;
+  }
+
+  const labels: Record<string, string> = {
+    restaurant: "餐廳",
+    cafe: "咖啡店",
+    fast_food: "速食店",
+    bank: "銀行",
+    pharmacy: "藥局",
+    hospital: "醫院",
+    clinic: "診所",
+    school: "學校",
+    university: "大學",
+    hotel: "旅館",
+    convenience: "便利店",
+    supermarket: "超市",
+    clothes: "服飾店",
+    beauty: "美容店",
+    mall: "商場",
+    attraction: "景點",
+    office: "辦公室",
+    commercial: "商業大廈",
+    apartments: "住宅大樓",
+    bus_station: "巴士總站",
+    ferry_terminal: "渡輪碼頭",
+  };
+
+  return labels[raw] || raw.replaceAll("_", " ");
+}
+
+function isTargetRoadPlace(streetName: string | null, roadName: string): boolean {
+  if (!streetName || !roadName) {
+    return false;
+  }
+  return isRoadNameMatch(normalizeRoadName(streetName), normalizeRoadName(roadName), tokenizeRoadQuery(roadName));
+}
+
+function expandBBoxAroundSegment(
+  start: { lat: number; lon: number },
+  end: { lat: number; lon: number },
+  padMeters: number,
+): BBox {
+  const avgLat = (start.lat + end.lat) / 2;
+  const latPad = metersToLatDegrees(padMeters);
+  const lonPad = metersToLonDegrees(padMeters, avgLat);
+  return {
+    south: Math.min(start.lat, end.lat) - latPad,
+    west: Math.min(start.lon, end.lon) - lonPad,
+    north: Math.max(start.lat, end.lat) + latPad,
+    east: Math.max(start.lon, end.lon) + lonPad,
+  };
+}
+
+function projectPointToSegmentMeters(
+  start: { lat: number; lon: number },
+  end: { lat: number; lon: number },
+  point: { lat: number; lon: number },
+): { alongMeters: number; distanceToLineMeters: number } {
+  const startVec = { x: 0, y: 0 };
+  const endVec = toLocalMeters(start, end);
+  const pointVec = toLocalMeters(start, point);
+  const dx = endVec.x - startVec.x;
+  const dy = endVec.y - startVec.y;
+  const lenSq = dx * dx + dy * dy;
+
+  if (lenSq <= 1e-6) {
+    return { alongMeters: 0, distanceToLineMeters: Math.sqrt(pointVec.x ** 2 + pointVec.y ** 2) };
+  }
+
+  const t = Math.max(0, Math.min(1, (pointVec.x * dx + pointVec.y * dy) / lenSq));
+  const projX = dx * t;
+  const projY = dy * t;
+  const diffX = pointVec.x - projX;
+  const diffY = pointVec.y - projY;
+  return {
+    alongMeters: Math.sqrt(dx * dx + dy * dy) * t,
+    distanceToLineMeters: Math.sqrt(diffX * diffX + diffY * diffY),
+  };
+}
+
+function toLocalMeters(origin: { lat: number; lon: number }, point: { lat: number; lon: number }): { x: number; y: number } {
+  const avgLatRad = ((origin.lat + point.lat) / 2) * (Math.PI / 180);
+  return {
+    x: (point.lon - origin.lon) * 111_320 * Math.cos(avgLatRad),
+    y: (point.lat - origin.lat) * 110_540,
+  };
+}
+
+function metersToLatDegrees(meters: number): number {
+  return meters / 110_540;
+}
+
+function metersToLonDegrees(meters: number, lat: number): number {
+  const cosLat = Math.max(0.1, Math.cos((lat * Math.PI) / 180));
+  return meters / (111_320 * cosLat);
+}
+
+function sanitizeErrorMessage(message: string): string {
+  if (/api[_-]?key/i.test(message)) return "Configuration error";
+  if (/\bD1\b|sqlite|database/i.test(message)) return "Database error";
+  if (message.includes("sk_") || message.includes("pk_")) return "Configuration error";
+  return message;
+}
+
 async function withErrorHandling(fn: () => Promise<Response>): Promise<Response> {
   try {
     return await fn();
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Unexpected error";
-    return json({ error: message }, 500);
+    const raw = err instanceof Error ? err.message : "Unexpected error";
+    console.error({ timestamp: new Date().toISOString(), error: raw });
+    const status =
+      raw === "Authentication required" || raw === "Invalid or expired session"
+        ? 401
+        : raw === "Cloudflare Access authentication required"
+          ? 401
+        : raw === "Your account is pending approval" || raw === "Admin access required"
+          ? 403
+          : raw === "Access denied for this email"
+            ? 403
+            : raw === "Too many requests"
+              ? 429
+          : 500;
+    return json({ error: sanitizeErrorMessage(raw) }, status);
   }
+}
+
+async function enforceGatewayPolicies(request: Request, env: Env, path: string): Promise<void> {
+  enforceAllowedAccessEmails(request, env);
+  const pathGroup =
+    path.startsWith("/api/paid/") || path.startsWith("/api/google/") ? "paid" : "default";
+  const perWindow = pathGroup === "paid" ? RATE_LIMIT_PAID_PER_WINDOW : RATE_LIMIT_DEFAULT_PER_WINDOW;
+  await enforceRateLimit(request, env, `ip:${pathGroup}`, perWindow, RATE_LIMIT_WINDOW_SECONDS);
+}
+
+function enforceAllowedAccessEmails(request: Request, env: Env): void {
+  const host = new URL(request.url).hostname.toLowerCase();
+  if (host === "127.0.0.1" || host === "localhost") {
+    return;
+  }
+
+  const allowed = String(env.ALLOWED_ACCESS_EMAILS || "")
+    .split(",")
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (allowed.length === 0) {
+    return;
+  }
+
+  const email = String(request.headers.get("cf-access-authenticated-user-email") || "")
+    .trim()
+    .toLowerCase();
+
+  if (!email) {
+    throw new Error("Cloudflare Access authentication required");
+  }
+  if (!allowed.includes(email)) {
+    throw new Error("Access denied for this email");
+  }
+}
+
+async function enforceRateLimit(
+  request: Request,
+  env: Env,
+  scope: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<void> {
+  const ip = getClientIp(request);
+  if (!ip) {
+    return;
+  }
+
+  await ensureD1Schema(env);
+  const now = nowEpoch();
+  const bucket = Math.floor(now / windowSeconds);
+  const expiresAt = (bucket + 1) * windowSeconds + windowSeconds;
+  const key = `${scope}:${ip}:${bucket}`;
+
+  const row = await env.DB.prepare(
+    `INSERT INTO rate_limits (rate_key, count, expires_at, updated_at)
+     VALUES (?1, 1, ?2, ?3)
+     ON CONFLICT(rate_key) DO UPDATE SET
+       count = count + 1,
+       updated_at = excluded.updated_at
+     RETURNING count`,
+  )
+    .bind(key, expiresAt, now)
+    .first<{ count: number }>();
+
+  const count = Number(row?.count || 0);
+  if (count > limit) {
+    throw new Error("Too many requests");
+  }
+
+  if (Math.random() < 0.02) {
+    await env.DB.prepare("DELETE FROM rate_limits WHERE expires_at < ?1").bind(now).run();
+  }
+}
+
+function getClientIp(request: Request): string {
+  const direct = String(request.headers.get("cf-connecting-ip") || "").trim();
+  if (direct) {
+    return direct;
+  }
+  const forwarded = String(request.headers.get("x-forwarded-for") || "").trim();
+  if (!forwarded) {
+    return "";
+  }
+  return forwarded.split(",")[0]?.trim() || "";
+}
+
+function getEdgeCache(): Cache {
+  return (caches as CacheStorage & { default: Cache }).default;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -442,39 +1788,184 @@ function requireGoogleMapsKey(env: Env): string {
   return env.GOOGLE_MAPS_API_KEY;
 }
 
-function requireGoogleVisionKey(env: Env): string {
-  const key = env.GOOGLE_VISION_API_KEY || env.GOOGLE_MAPS_API_KEY;
+function requireGeminiKey(env: Env): string {
+  const key = env.GEMINI_API_KEY;
   if (!key) {
-    throw new Error("GOOGLE_VISION_API_KEY is not configured");
+    throw new Error("GEMINI_API_KEY is not configured");
   }
   return key;
 }
 
-function requireAllowedUser(request: Request, env: Env): void {
-  const configured = (env.ALLOWED_ACCESS_EMAILS || "").trim();
-  if (!configured) {
-    return;
+// ── Clerk authentication ──────────────────────────────────────────────────
+function base64UrlDecode(input: string): Uint8Array {
+  const base64 = input.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, "=");
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+}
+
+async function fetchClerkJWKS(): Promise<JsonWebKey[]> {
+  const edgeReq = new Request(`https://cache.local/clerk-jwks/${CLERK_DOMAIN}`);
+  const cached = await getEdgeCache().match(edgeReq);
+  if (cached) {
+    const data = (await cached.json()) as { keys: JsonWebKey[] };
+    return data.keys;
   }
+  const res = await fetchWithTimeout(`https://${CLERK_DOMAIN}/.well-known/jwks.json`, {}, 5000);
+  if (!res.ok) throw new Error("Failed to fetch authentication keys");
+  const data = (await res.json()) as { keys: JsonWebKey[] };
+  await getEdgeCache().put(
+    edgeReq,
+    new Response(JSON.stringify(data), {
+      headers: { "cache-control": "public, max-age=3600", "content-type": "application/json" },
+    }),
+  );
+  return data.keys;
+}
 
-  const host = new URL(request.url).hostname.toLowerCase();
-  if (host === "127.0.0.1" || host === "localhost") {
-    return;
-  }
-
-  const current = (request.headers.get("cf-access-authenticated-user-email") || "").trim().toLowerCase();
-  const allowed = configured
-    .split(",")
-    .map((it) => it.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (!current || !allowed.includes(current)) {
-    throw new Error("This API is restricted to invited users");
+async function verifyClerkToken(token: string): Promise<{ userId: string; payload: ClerkJwtPayload } | null> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, signatureB64] = parts;
+    const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(headerB64))) as {
+      kid: string;
+      alg: string;
+    };
+    if (header.alg !== "RS256") return null;
+    const keys = await fetchClerkJWKS();
+    const jwk = keys.find((k) => (k as Record<string, unknown>).kid === header.kid);
+    if (!jwk) return null;
+    const key = await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+    const signatureBytes = base64UrlDecode(signatureB64);
+    const signature = new Uint8Array(signatureBytes.length);
+    signature.set(signatureBytes);
+    const valid = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, signature, signingInput);
+    if (!valid) return null;
+    const payload = JSON.parse(
+      new TextDecoder().decode(base64UrlDecode(payloadB64)),
+    ) as ClerkJwtPayload;
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.sub || !Number.isFinite(payload.exp)) return null;
+    if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (Number.isFinite(payload.nbf) && Number(payload.nbf) > now + 30) return null;
+    if (Number.isFinite(payload.iat) && Number(payload.iat) > now + 30) return null;
+    return { userId: payload.sub, payload };
+  } catch {
+    return null;
   }
 }
 
+function issuerMatches(iss: string | undefined): boolean {
+  const normalized = String(iss || "").trim().replace(/\/+$/, "");
+  return normalized === CLERK_ISSUER.replace(/\/+$/, "");
+}
+
+function audienceMatches(aud: string | string[] | undefined, expected: string): boolean {
+  if (!aud) return false;
+  const target = expected.trim();
+  if (!target) return true;
+  if (Array.isArray(aud)) {
+    return aud.some((item) => String(item).trim() === target);
+  }
+  return String(aud).trim() === target;
+}
+
+async function getClerkUserMeta(
+  userId: string,
+  secretKey: string,
+): Promise<{ approved: boolean; email: string; isAdmin: boolean }> {
+  const edgeReq = new Request(`https://cache.local/clerk-user-meta/${userId}`);
+  const cached = await getEdgeCache().match(edgeReq);
+  if (cached) {
+    return (await cached.json()) as { approved: boolean; email: string; isAdmin: boolean };
+  }
+  const res = await fetchWithTimeout(
+    `https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`,
+    { headers: { Authorization: `Bearer ${secretKey}` } },
+    5000,
+  );
+  if (!res.ok) return { approved: false, email: "", isAdmin: false };
+  const user = (await res.json()) as {
+    public_metadata?: { approved?: boolean; role?: string };
+    email_addresses?: Array<{ email_address: string }>;
+  };
+  const approved = user.public_metadata?.approved === true;
+  const isAdmin = user.public_metadata?.role === "admin";
+  const email = user.email_addresses?.[0]?.email_address || "";
+  const result = { approved, email, isAdmin };
+  await getEdgeCache().put(
+    edgeReq,
+    new Response(JSON.stringify(result), {
+      headers: { "cache-control": "public, max-age=60", "content-type": "application/json" },
+    }),
+  );
+  return result;
+}
+
+async function requireClerkAuth(
+  request: Request,
+  env: Env,
+): Promise<{ userId: string; email: string; isAdmin: boolean }> {
+  const host = new URL(request.url).hostname.toLowerCase();
+  const isDev = host === "127.0.0.1" || host === "localhost";
+  const devBypass = String(env.ALLOW_DEV_BYPASS || "").toLowerCase() === "true";
+  if (isDev && devBypass) {
+    return { userId: "dev", email: "dev@local", isAdmin: true };
+  }
+  const secretKey = env.CLERK_SECRET_KEY || "";
+  if (!secretKey) {
+    throw new Error("Authentication not configured");
+  }
+  const authHeader = request.headers.get("Authorization") || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    throw new Error("Authentication required");
+  }
+  const token = authHeader.slice(7);
+  const verified = await verifyClerkToken(token);
+  if (!verified) {
+    throw new Error("Invalid or expired session");
+  }
+  if (!issuerMatches(verified.payload.iss)) {
+    throw new Error("Invalid or expired session");
+  }
+  const expectedAud = String(env.CLERK_JWT_AUDIENCE || "").trim();
+  if (expectedAud && !audienceMatches(verified.payload.aud, expectedAud)) {
+    throw new Error("Invalid or expired session");
+  }
+  await enforceRateLimit(request, env, `user-auth:${verified.userId}`, RATE_LIMIT_DEFAULT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS);
+  const meta = await getClerkUserMeta(verified.userId, secretKey);
+  if (!meta.approved) {
+    throw new Error("Your account is pending approval");
+  }
+  return { userId: verified.userId, email: meta.email, isAdmin: meta.isAdmin };
+}
+
+async function requireAdminAuth(
+  request: Request,
+  env: Env,
+): Promise<{ userId: string; email: string }> {
+  const user = await requireClerkAuth(request, env);
+  if (!user.isAdmin) {
+    throw new Error("Admin access required");
+  }
+  return user;
+}
+
 async function handlePaidPlaces(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-  requireAllowedUser(request, env);
+  const clerkUser = await requireClerkAuth(request, env);
   await ensureD1Schema(env);
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (contentLength > MAX_REQUEST_BODY_BYTES) {
+    throw new Error("Request body too large");
+  }
   const body = await requireJson(request);
   requireUserConfirmedPaidCall(body);
 
@@ -483,9 +1974,12 @@ async function handlePaidPlaces(request: Request, env: Env, _ctx: ExecutionConte
   if (intersections.length === 0) {
     throw new Error("intersections is required");
   }
+  if (intersections.length > MAX_PAID_INTERSECTIONS) {
+    throw new Error(`Maximum ${MAX_PAID_INTERSECTIONS} intersections per request`);
+  }
 
   const apiKey = requireGoogleMapsKey(env);
-  const language = env.GOOGLE_MAPS_LANGUAGE || "zh-TW";
+  const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
 
   const lines: string[] = [];
   let billableCalls = 0;
@@ -495,6 +1989,7 @@ async function handlePaidPlaces(request: Request, env: Env, _ctx: ExecutionConte
     const row = item as Json;
     const lat = Number(row.lat);
     const lon = Number(row.lon);
+    validateCoordinates(lat, lon);
     const name = String(row.name || `${lat},${lon}`);
 
     const payload = { lat: round6(lat), lon: round6(lon), radius, language };
@@ -515,9 +2010,10 @@ async function handlePaidPlaces(request: Request, env: Env, _ctx: ExecutionConte
       billableCalls += 1;
     }
 
-    const list = Array.isArray((cached.data as Json).results) ? ((cached.data as Json).results as Json[]) : [];
+    const list = Array.isArray((cached.data as Json).places) ? ((cached.data as Json).places as Json[]) : [];
     const top = list.slice(0, 5).map((p) => {
-      const title = String(p.name || "未命名地標");
+      const displayName = (p.displayName || {}) as Json;
+      const title = String(displayName.text || "未命名地標");
       const types = Array.isArray(p.types) ? (p.types as string[]).slice(0, 2).join("/") : "";
       return `- ${title}${types ? `（${types}）` : ""}`;
     });
@@ -534,6 +2030,7 @@ async function handlePaidPlaces(request: Request, env: Env, _ctx: ExecutionConte
     cacheHit: billableCalls === 0 ? 1 : 0,
     estimatedUsd,
     actualUsd,
+    userId: clerkUser.userId,
   });
 
   const text = [
@@ -556,8 +2053,8 @@ async function handlePaidPlaces(request: Request, env: Env, _ctx: ExecutionConte
   });
 }
 
-async function handlePaidStreetView(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-  requireAllowedUser(request, env);
+async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const clerkUser = await requireClerkAuth(request, env);
   await ensureD1Schema(env);
   const body = await requireJson(request);
   requireUserConfirmedPaidCall(body);
@@ -567,73 +2064,118 @@ async function handlePaidStreetView(request: Request, env: Env, _ctx: ExecutionC
   const heading = Number(body.heading ?? 0);
   const fov = Number(body.fov ?? 90);
   const pitch = Number(body.pitch ?? 0);
-  const language = env.GOOGLE_MAPS_LANGUAGE || "zh-TW";
-
+  const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
+  validateCoordinates(lat, lon);
   const mapsKey = requireGoogleMapsKey(env);
-  const visionKey = requireGoogleVisionKey(env);
+  const geminiKey = requireGeminiKey(env);
 
-  const headings = [heading, heading + 90, heading + 270].map((h) => normalizeHeading(h));
+  const views = [
+    { label: "左側", heading: normalizeHeading(heading + 90) },
+    { label: "右側", heading: normalizeHeading(heading + 270) },
+  ];
   let billableImages = 0;
-  let billableVision = 0;
-  let cacheHits = 0;
+  let billableGemini = 0;
+  let imageCacheHits = 0;
+  let geminiCacheHits = 0;
 
   const blocks: string[] = [];
 
-  for (const h of headings) {
+  for (const view of views) {
     const payload = {
       lat: round6(lat),
       lon: round6(lon),
-      heading: h,
+      heading: view.heading,
       fov,
       pitch,
+    };
+
+    const metaStatus = await fetchStreetViewMetadata(mapsKey, payload.lat, payload.lon);
+    if (metaStatus === "ZERO_RESULTS" || metaStatus === "NOT_FOUND") {
+      const visionText = `此地點無 Street View 覆蓋（${metaStatus}）`;
+      blocks.push(`${view.label}：${visionText}`);
+      continue;
+    }
+
+    const imageCached = await getOrCreateCached(
+      env,
+      "streetview-image-v1",
+      payload,
+      async () => {
+        const imageUrl = buildStreetViewUrl(mapsKey, { ...payload, language: "en" });
+        const imageBytes = await fetchImageBytes(imageUrl);
+        const imageObjectKey = await storeStreetViewImage(env, payload, imageBytes);
+        return { imageUrl, imageObjectKey };
+      },
+      TTL_365_DAYS,
+      {
+        ctx,
+        staleWhileRevalidateSeconds: 30 * DAY,
+      },
+    );
+
+    if (imageCached.cacheHit) {
+      imageCacheHits += 1;
+    } else {
+      billableImages += 1;
+    }
+
+    const textPayload = {
+      ...payload,
       language,
     };
 
-    const cached = await getOrCreateCached(
+    const textCached = await getOrCreateCached(
       env,
-      "streetview-vision-v2",
-      payload,
+      "streetview-gemini-text-v1",
+      textPayload,
       async () => {
-        const imageUrl = buildStreetViewUrl(mapsKey, payload);
-        const vision = await fetchVisionDescription(visionKey, imageUrl);
-        const visionErr = getVisionErrorMessage(vision);
-        if (visionErr) {
-          throw new Error(`Google Vision 失敗：${visionErr}`);
+        const imageObjectKey = String((imageCached.data as Json).imageObjectKey || "").trim();
+        if (!imageObjectKey) {
+          throw new Error("Street View image cache key is missing");
         }
-        return {
-          imageUrl,
-          vision,
-        };
+        const imageObj = await env.CACHE_BUCKET.get(imageObjectKey);
+        if (!imageObj) {
+          throw new Error("Street View image cache not found");
+        }
+        const imageBytes = new Uint8Array(await imageObj.arrayBuffer());
+        const imageBase64 = bytesToBase64(imageBytes);
+        const description = await fetchGeminiDescription(geminiKey, imageBase64, language);
+        return { description };
       },
       TTL_365_DAYS,
+      {
+        ctx,
+        staleWhileRevalidateSeconds: 30 * DAY,
+      },
     );
 
-    if (cached.cacheHit) {
-      cacheHits += 1;
+    if (textCached.cacheHit) {
+      geminiCacheHits += 1;
     } else {
-      billableImages += 1;
-      billableVision += 1;
+      billableGemini += 1;
     }
 
-    const visionText = extractVisionText((cached.data as Json).vision as Json);
-    blocks.push(`方位 ${headingLabel(h)}：${visionText}`);
+    const visionText = String((textCached.data as Json).description || "未取得完整描述");
+    blocks.push(`${view.label}：${visionText}`);
   }
 
-  const estimatedCalls = headings.length * 2;
-  const estimatedUsd = headings.length * (PRICES.streetViewStatic + PRICES.visionAnnotate);
-  const actualUsd = billableImages * PRICES.streetViewStatic + billableVision * PRICES.visionAnnotate;
+  const estimatedCalls = views.length * 2;
+  const estimatedUsd = views.length * (PRICES.streetViewStatic + PRICES.geminiGenerate);
+  const actualUsd = billableImages * PRICES.streetViewStatic + billableGemini * PRICES.geminiGenerate;
 
   await recordBilling(env, {
     provider: "streetview",
-    cacheHit: billableImages === 0 ? 1 : 0,
+    cacheHit: billableImages + billableGemini === 0 ? 1 : 0,
     estimatedUsd,
     actualUsd,
+    userId: clerkUser.userId,
   });
 
   const text = [
     "街景詳細描述完成。",
     `預估請求 ${estimatedCalls} 次，預估費用 $${estimatedUsd.toFixed(3)}。`,
-    `實際計費影像 ${billableImages} 次，Vision ${billableVision} 次，cache 命中 ${cacheHits} 次。`,
+    `Street View：新請求 ${billableImages} 次，圖片快取命中 ${imageCacheHits} 次。`,
+    `Gemini：新請求 ${billableGemini} 次，描述快取命中 ${geminiCacheHits} 次。`,
     `實際費用 $${actualUsd.toFixed(3)}。`,
     "",
     ...blocks,
@@ -643,12 +2185,413 @@ async function handlePaidStreetView(request: Request, env: Env, _ctx: ExecutionC
     ok: true,
     provider: "streetview",
     estimatedCalls,
-    billableCalls: billableImages + billableVision,
-    cacheHits,
+    billableCalls: billableImages + billableGemini,
+    cacheHits: imageCacheHits + geminiCacheHits,
+    imageCacheHits,
+    geminiCacheHits,
+    billableImages,
+    billableGemini,
     estimatedUsd,
     actualUsd,
     text,
   });
+}
+
+async function handleStreetViewMetadata(request: Request, env: Env): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("lat and lon are required");
+  }
+
+  const mapsKey = requireGoogleMapsKey(env);
+  const status = await fetchStreetViewMetadata(mapsKey, lat, lon);
+
+  return json({
+    ok: true,
+    lat,
+    lon,
+    metadataStatus: status,
+    hasStreetView: status === "OK",
+  });
+}
+
+async function handleCleanupNoImage(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  await ensureD1Schema(env);
+
+  const body = await requireJson(request);
+  const provider = String(body.provider || "streetview-image-v1").trim();
+  if (!provider) {
+    throw new Error("provider is required");
+  }
+
+  const list = await env.DB.prepare(
+    "SELECT cache_key, object_key FROM api_cache WHERE provider = ?1",
+  ).bind(provider).all<{ cache_key: string; object_key: string }>();
+
+  const rows = Array.isArray(list.results) ? list.results : [];
+  let deletedCount = 0;
+  let scannedCount = 0;
+
+  for (const row of rows) {
+    scannedCount += 1;
+    const obj = await env.CACHE_BUCKET.get(row.object_key);
+    if (!obj) {
+      continue;
+    }
+
+    let payload: Json | null = null;
+    try {
+      payload = (await obj.json()) as Json;
+    } catch {
+      payload = null;
+    }
+    if (!payload || payload.noImage !== true) {
+      continue;
+    }
+
+    await env.CACHE_BUCKET.delete(row.object_key);
+    await env.DB.prepare("DELETE FROM api_cache WHERE cache_key = ?1 AND provider = ?2")
+      .bind(row.cache_key, provider)
+      .run();
+    const edgeReq = new Request(`https://cache.local/${provider}/${row.cache_key}`);
+    await getEdgeCache().delete(edgeReq);
+    deletedCount += 1;
+  }
+
+  return json({
+    ok: true,
+    provider,
+    scannedCount,
+    deletedNoImageCount: deletedCount,
+  });
+}
+
+async function handleStreetViewStorageReport(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  await ensureD1Schema(env);
+  await requireJson(request);
+
+  const provider = "streetview-image-v1";
+  const list = await env.DB.prepare(
+    "SELECT cache_key, object_key FROM api_cache WHERE provider = ?1",
+  ).bind(provider).all<{ cache_key: string; object_key: string }>();
+
+  const rows = Array.isArray(list.results) ? list.results : [];
+  let cacheEntryCount = 0;
+  let missingCacheObjectCount = 0;
+  let missingImageObjectCount = 0;
+  let noImageEntryCount = 0;
+  let totalBytes = 0;
+  const seenImageObjectKeys = new Set<string>();
+
+  const items: Array<{ cacheKey: string; imageObjectKey: string; bytes: number }> = [];
+
+  for (const row of rows) {
+    cacheEntryCount += 1;
+    const cacheObj = await env.CACHE_BUCKET.get(row.object_key);
+    if (!cacheObj) {
+      missingCacheObjectCount += 1;
+      continue;
+    }
+
+    const payload = (await cacheObj.json()) as Json;
+    if (payload.noImage === true) {
+      noImageEntryCount += 1;
+      continue;
+    }
+
+    const imageObjectKey = String(payload.imageObjectKey || "").trim();
+    if (!imageObjectKey || seenImageObjectKeys.has(imageObjectKey)) {
+      continue;
+    }
+
+    const imageObj = await env.CACHE_BUCKET.get(imageObjectKey);
+    if (!imageObj) {
+      missingImageObjectCount += 1;
+      continue;
+    }
+
+    const bytes = (await imageObj.arrayBuffer()).byteLength;
+    totalBytes += bytes;
+    seenImageObjectKeys.add(imageObjectKey);
+    items.push({
+      cacheKey: row.cache_key,
+      imageObjectKey,
+      bytes,
+    });
+  }
+
+  return json({
+    ok: true,
+    provider,
+    cacheEntryCount,
+    imageObjectCount: seenImageObjectKeys.size,
+    noImageEntryCount,
+    missingCacheObjectCount,
+    missingImageObjectCount,
+    totalBytes,
+    totalKilobytes: Number((totalBytes / 1024).toFixed(2)),
+    items,
+  });
+}
+
+async function handleAdminCacheStats(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  await ensureD1Schema(env);
+
+  const now = nowEpoch();
+  const rows = await env.DB.prepare(
+    "SELECT provider, cache_key, object_key, expires_at, cache_meta FROM api_cache",
+  ).all<{ provider: string; cache_key: string; object_key: string; expires_at: number; cache_meta: string | null }>();
+
+  const items = Array.isArray(rows.results) ? rows.results : [];
+  const byProvider = new Map<string, {
+    provider: string;
+    cacheEntryCount: number;
+    expiredEntryCount: number;
+    missingObjectCount: number;
+    totalBytes: number;
+  }>();
+
+  for (const row of items) {
+    const provider = String(row.provider || "unknown");
+    const stat = byProvider.get(provider) || {
+      provider,
+      cacheEntryCount: 0,
+      expiredEntryCount: 0,
+      missingObjectCount: 0,
+      totalBytes: 0,
+    };
+    stat.cacheEntryCount += 1;
+    if (Number(row.expires_at) <= now) {
+      stat.expiredEntryCount += 1;
+    }
+
+    const obj = await env.CACHE_BUCKET.get(row.object_key);
+    if (!obj) {
+      stat.missingObjectCount += 1;
+      byProvider.set(provider, stat);
+      continue;
+    }
+
+    const size = Number((obj as { size?: number }).size || 0);
+    if (Number.isFinite(size) && size > 0) {
+      stat.totalBytes += size;
+    } else {
+      stat.totalBytes += (await obj.arrayBuffer()).byteLength;
+    }
+    byProvider.set(provider, stat);
+  }
+
+  const providers = [...byProvider.values()]
+    .map((item) => ({
+      ...item,
+      totalMiB: Number((item.totalBytes / (1024 * 1024)).toFixed(3)),
+      totalGiB: Number((item.totalBytes / (1024 * 1024 * 1024)).toFixed(4)),
+    }))
+    .sort((a, b) => b.totalBytes - a.totalBytes);
+
+  const totalBytes = providers.reduce((sum, item) => sum + item.totalBytes, 0);
+
+  return json({
+    ok: true,
+    generatedAt: now,
+    totals: {
+      cacheEntryCount: items.length,
+      totalBytes,
+      totalMiB: Number((totalBytes / (1024 * 1024)).toFixed(3)),
+      totalGiB: Number((totalBytes / (1024 * 1024 * 1024)).toFixed(4)),
+    },
+    limits: {
+      d1StorageGiBFree: 5,
+      r2StorageGiBFree: 10,
+    },
+    providers,
+  });
+}
+
+async function handleAdminCachePurgeExpired(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  await ensureD1Schema(env);
+
+  const body = await requireJson(request);
+  const provider = String(body.provider || "").trim();
+  const maxDelete = Math.max(1, Math.min(2000, Number(body.maxDelete ?? 500)));
+  const now = nowEpoch();
+
+  const sql = provider
+    ? "SELECT provider, cache_key, object_key FROM api_cache WHERE provider = ?1 AND expires_at <= ?2 ORDER BY expires_at ASC LIMIT ?3"
+    : "SELECT provider, cache_key, object_key FROM api_cache WHERE expires_at <= ?1 ORDER BY expires_at ASC LIMIT ?2";
+
+  const rows = provider
+    ? await env.DB.prepare(sql).bind(provider, now, maxDelete).all<{ provider: string; cache_key: string; object_key: string }>()
+    : await env.DB.prepare(sql).bind(now, maxDelete).all<{ provider: string; cache_key: string; object_key: string }>();
+
+  const items = Array.isArray(rows.results) ? rows.results : [];
+  let deletedCount = 0;
+  let deletedBytes = 0;
+
+  for (const row of items) {
+    const obj = await env.CACHE_BUCKET.get(row.object_key);
+    if (obj) {
+      const size = Number((obj as { size?: number }).size || 0);
+      deletedBytes += Number.isFinite(size) && size > 0 ? size : (await obj.arrayBuffer()).byteLength;
+    }
+
+    await env.CACHE_BUCKET.delete(row.object_key);
+    await env.DB.prepare("DELETE FROM api_cache WHERE cache_key = ?1 AND provider = ?2")
+      .bind(row.cache_key, row.provider)
+      .run();
+    const edgeReq = new Request(`https://cache.local/${row.provider}/${row.cache_key}`);
+    await getEdgeCache().delete(edgeReq);
+    deletedCount += 1;
+  }
+
+  return json({
+    ok: true,
+    provider: provider || "all",
+    maxDelete,
+    matched: items.length,
+    deletedCount,
+    deletedBytes,
+    deletedMiB: Number((deletedBytes / (1024 * 1024)).toFixed(3)),
+  });
+}
+
+async function handleAdminCacheStreets(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  await ensureD1Schema(env);
+
+  const now = nowEpoch();
+  const rows = await env.DB.prepare(
+    "SELECT provider, cache_key, object_key, expires_at, cache_meta FROM api_cache WHERE provider = ?1 ORDER BY expires_at ASC LIMIT 2000",
+  ).bind("osm-segment-v2").all<{
+    provider: string;
+    cache_key: string;
+    object_key: string;
+    expires_at: number;
+    cache_meta: string | null;
+  }>();
+
+  const items = Array.isArray(rows.results) ? rows.results : [];
+  const grouped = new Map<string, {
+    roadName: string;
+    countryOrRegion: string;
+    expiresAt: number;
+    expiresInSeconds: number;
+    status: string;
+    mergedCount: number;
+  }>();
+
+  for (const row of items) {
+    const meta = parseCacheMeta(row.cache_meta);
+    const obj = await env.CACHE_BUCKET.get(row.object_key);
+    const payload = obj ? ((await obj.json()) as Json) : {};
+
+    const payloadRoadName = String(payload.roadName || payload.queryRoadName || "").trim();
+    const metaRoadName = String(meta.roadName || meta.queryRoadName || "").trim();
+    const roadName = payloadRoadName || metaRoadName || "(unknown road)";
+    const country = resolveCacheCountry(meta, payload, roadName);
+    const key = `${country}|${normalizeRoadName(roadName)}`;
+    const expiresAt = Number(row.expires_at || 0);
+    const expiresInSeconds = expiresAt - now;
+
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, {
+        roadName,
+        countryOrRegion: country,
+        expiresAt,
+        expiresInSeconds,
+        status: expiresInSeconds > 0 ? "fresh-or-stale-window" : "expired",
+        mergedCount: 1,
+      });
+      continue;
+    }
+
+    existing.mergedCount += 1;
+    if (expiresAt > existing.expiresAt) {
+      existing.expiresAt = expiresAt;
+      existing.expiresInSeconds = expiresInSeconds;
+      existing.status = expiresInSeconds > 0 ? "fresh-or-stale-window" : "expired";
+    }
+    if (roadName.length > existing.roadName.length) {
+      existing.roadName = roadName;
+    }
+  }
+
+  const entries: Array<{
+    roadName: string;
+    countryOrRegion: string;
+    expiresAt: number;
+    expiresInSeconds: number;
+    status: string;
+    mergedCount: number;
+  }> = [...grouped.values()];
+
+  entries.sort((a, b) => a.expiresInSeconds - b.expiresInSeconds);
+
+  return json({
+    ok: true,
+    generatedAt: now,
+    rawCount: items.length,
+    count: entries.length,
+    entries,
+  });
+}
+
+function resolveCacheCountry(meta: Json, payload: Json, roadName: string): string {
+  const direct = String(meta.countryCode || payload.countryCode || "").trim().toUpperCase();
+  if (direct) {
+    return direct;
+  }
+
+  const diagnostics = (payload.diagnostics || {}) as Json;
+  const bbox = (diagnostics.initialBBox || diagnostics.finalBBox || {}) as Json;
+  const south = Number(bbox.south);
+  const west = Number(bbox.west);
+  const north = Number(bbox.north);
+  const east = Number(bbox.east);
+  if ([south, west, north, east].every(Number.isFinite)) {
+    const centerLat = (south + north) / 2;
+    const centerLon = (west + east) / 2;
+    if (centerLat >= 22 && centerLat <= 22.7 && centerLon >= 113.7 && centerLon <= 114.5) {
+      return "HK";
+    }
+    if (centerLat >= 21.5 && centerLat <= 26 && centerLon >= 119 && centerLon <= 122.2) {
+      return "TW";
+    }
+  }
+
+  const normalized = normalizeRoadName(roadName);
+  if (
+    normalized.includes("香港") ||
+    normalized.includes("九龍") ||
+    normalized.includes("hongkong") ||
+    normalized.includes("kowloon") ||
+    normalized.includes("nathanroad") ||
+    normalized.includes("彌敦道")
+  ) {
+    return "HK";
+  }
+
+  return "未設定";
+}
+
+function parseCacheMeta(raw: string | null): Json {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as Json;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function tokenizeRoadQuery(name: string): string[] {
@@ -702,7 +2645,7 @@ function isRoadNameMatch(nameNorm: string, queryNorm: string, queryTokens: strin
   return queryTokens.some((token) => token.length >= 2 && (nameNorm.includes(token) || token.includes(nameNorm)));
 }
 async function handlePaidRouteScenery(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-  requireAllowedUser(request, env);
+  const clerkUser = await requireClerkAuth(request, env);
   await ensureD1Schema(env);
   const body = await requireJson(request);
   requireUserConfirmedPaidCall(body);
@@ -711,9 +2654,10 @@ async function handlePaidRouteScenery(request: Request, env: Env, _ctx: Executio
   const end = body.end as Json;
   const intervalMeters = Number(body.intervalMeters ?? 50);
   const heading = Number(body.heading ?? 0);
+  const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
 
   const mapsKey = requireGoogleMapsKey(env);
-  const visionKey = requireGoogleVisionKey(env);
+  const geminiKey = requireGeminiKey(env);
 
   const points = sampleLineByMeters(
     { lat: Number(start.lat), lon: Number(start.lon) },
@@ -722,7 +2666,7 @@ async function handlePaidRouteScenery(request: Request, env: Env, _ctx: Executio
   );
 
   let billableImages = 0;
-  let billableVision = 0;
+  let billableGemini = 0;
   let cacheHits = 0;
 
   const lines: string[] = [];
@@ -742,53 +2686,58 @@ async function handlePaidRouteScenery(request: Request, env: Env, _ctx: Executio
 
     const cached = await getOrCreateCached(
       env,
-      "route-scenery-v2",
+      "route-scenery-gemini-v1",
       payload,
       async () => {
+        const metaStatus = await fetchStreetViewMetadata(mapsKey, payload.lat, payload.lon);
+        if (metaStatus === "ZERO_RESULTS" || metaStatus === "NOT_FOUND") {
+          return { noImage: true, metadataStatus: metaStatus };
+        }
         const imageUrl = buildStreetViewUrl(mapsKey, {
           lat: payload.lat,
           lon: payload.lon,
           heading: payload.heading,
           fov: payload.fov,
           pitch: payload.pitch,
-          language: env.GOOGLE_MAPS_LANGUAGE || "zh-TW",
+          language,
         });
-        const vision = await fetchVisionDescription(visionKey, imageUrl);
-        const visionErr = getVisionErrorMessage(vision);
-        if (visionErr) {
-          throw new Error(`Google Vision 失敗：${visionErr}`);
-        }
-        return { imageUrl, vision };
+        const imageBytes = await fetchImageBytes(imageUrl);
+        const imageBase64 = bytesToBase64(imageBytes);
+        const description = await fetchGeminiDescription(geminiKey, imageBase64, language);
+        return { imageUrl, description };
       },
       TTL_365_DAYS,
     );
 
     if (cached.cacheHit) {
       cacheHits += 1;
-    } else {
+    } else if (!(cached.data as Json).noImage) {
       billableImages += 1;
-      billableVision += 1;
+      billableGemini += 1;
     }
 
-    const text = extractVisionText((cached.data as Json).vision as Json);
+    const text = (cached.data as Json).noImage
+      ? `此地點無 Street View 覆蓋（${(cached.data as Json).metadataStatus}）`
+      : String((cached.data as Json).description || "未取得完整描述");
     lines.push(`${distance}m：${text}`);
   }
 
   const estimatedCalls = points.length * 2;
-  const estimatedUsd = points.length * (PRICES.streetViewStatic + PRICES.visionAnnotate);
-  const actualUsd = billableImages * PRICES.streetViewStatic + billableVision * PRICES.visionAnnotate;
+  const estimatedUsd = points.length * (PRICES.streetViewStatic + PRICES.geminiGenerate);
+  const actualUsd = billableImages * PRICES.streetViewStatic + billableGemini * PRICES.geminiGenerate;
 
   await recordBilling(env, {
     provider: "route-scenery",
     cacheHit: billableImages === 0 ? 1 : 0,
     estimatedUsd,
     actualUsd,
+    userId: clerkUser.userId,
   });
 
   const text = [
     `沿路景物描述完成，每 ${intervalMeters}m 採樣，共 ${points.length} 點。`,
     `預估請求 ${estimatedCalls} 次，預估費用 $${estimatedUsd.toFixed(3)}。`,
-    `實際計費影像 ${billableImages} 次，Vision ${billableVision} 次，cache 命中 ${cacheHits} 次。`,
+    `實際計費影像 ${billableImages} 次，Gemini ${billableGemini} 次，cache 命中 ${cacheHits} 次。`,
     `實際費用 $${actualUsd.toFixed(3)}。`,
     "",
     ...lines,
@@ -798,7 +2747,7 @@ async function handlePaidRouteScenery(request: Request, env: Env, _ctx: Executio
     ok: true,
     provider: "route-scenery",
     estimatedCalls,
-    billableCalls: billableImages + billableVision,
+    billableCalls: billableImages + billableGemini,
     cacheHits,
     estimatedUsd,
     actualUsd,
@@ -822,6 +2771,52 @@ function buildStreetViewUrl(
   return `https://maps.googleapis.com/maps/api/streetview?${p.toString()}`;
 }
 
+async function fetchStreetViewMetadata(apiKey: string, lat: number, lon: number): Promise<string> {
+  try {
+    const p = new URLSearchParams({ location: `${lat},${lon}`, key: apiKey });
+    const url = `https://maps.googleapis.com/maps/api/streetview/metadata?${p.toString()}`;
+    const res = await fetchWithTimeout(url, {}, 8000);
+    if (!res.ok) return "API_ERROR";
+    const body = (await res.json()) as Json;
+    return String(body.status || "UNKNOWN");
+  } catch {
+    return "API_ERROR";
+  }
+}
+
+async function fetchImageBytes(imageUrl: string): Promise<Uint8Array> {
+  const res = await fetchWithTimeout(imageUrl, {}, 15000);
+  if (!res.ok) {
+    throw new Error(`Street View image fetch failed: HTTP ${res.status}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function storeStreetViewImage(
+  env: Env,
+  payload: { lat: number; lon: number; heading: number; fov: number; pitch: number },
+  bytes: Uint8Array,
+): Promise<string> {
+  const key = await buildCacheKey("streetview-image-bytes-v1", payload);
+  const objectKey = `streetview-images/${key}.jpg`;
+  await env.CACHE_BUCKET.put(objectKey, bytes, {
+    httpMetadata: {
+      contentType: "image/jpeg",
+      cacheControl: `max-age=${CACHE_MAX_AGE_SECONDS}`,
+    },
+  });
+  return objectKey;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as unknown as number[]);
+  }
+  return btoa(binary);
+}
+
 async function fetchGooglePlaces(
   apiKey: string,
   lat: number,
@@ -829,64 +2824,117 @@ async function fetchGooglePlaces(
   radius: number,
   language: string,
 ): Promise<Json> {
-  const p = new URLSearchParams({
-    location: `${lat},${lon}`,
-    radius: String(radius),
-    language,
-    key: apiKey,
-  });
+  const url = "https://places.googleapis.com/v1/places:searchNearby";
+  const reqBody = {
+    languageCode: language,
+    maxResultCount: 15,
+    locationRestriction: {
+      circle: {
+        center: {
+          latitude: lat,
+          longitude: lon,
+        },
+        radius: Math.max(1, Math.min(50000, radius)),
+      },
+    },
+  };
 
-  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?${p.toString()}`;
-  const res = await fetch(url);
+  // Essentials-only fields to stay in Nearby Search (New) Essentials SKU.
+  const fieldMask = [
+    "places.displayName",
+    "places.formattedAddress",
+    "places.types",
+    "places.location",
+  ].join(",");
+
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Goog-Api-Key": apiKey,
+        "X-Goog-FieldMask": fieldMask,
+      },
+      body: JSON.stringify(reqBody),
+    },
+    10000,
+  );
   if (!res.ok) {
     throw new Error(`Google Places error: ${res.status}`);
   }
 
   const jsonBody = (await res.json()) as Json;
-  const status = String(jsonBody.status || "");
-  if (status !== "OK" && status !== "ZERO_RESULTS") {
-    throw new Error(`Google Places status: ${status}`);
+  const places = Array.isArray(jsonBody.places) ? (jsonBody.places as Json[]) : [];
+  if (!Array.isArray(places)) {
+    throw new Error("Google Places response malformed");
   }
-  return jsonBody;
+  return { places };
 }
 
-async function fetchVisionDescription(apiKey: string, imageUri: string): Promise<Json> {
-  const url = `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(apiKey)}`;
+function normalizeMapsLanguage(value: string): string {
+  const v = value.trim().toLowerCase();
+  if (v.startsWith("en")) return "en";
+  if (v.startsWith("ja")) return "ja";
+  if (v.startsWith("ko")) return "ko";
+  return "zh-TW";
+}
+
+async function fetchGeminiDescription(apiKey: string, imageBase64: string, language: string): Promise<string> {
+  const prompt = [
+    `Please answer in ${language} and provide 1 to 3 complete sentences.`,
+    "Focus on: shops, shop names, building, and traffic lights/pedestrian facilities (omit this part if none are visible).",
+    "If uncertain, clearly say it may be the case or cannot be fully confirmed.",
+    "Do not output lists or JSON.",
+  ].join("\n");
+
   const reqBody = {
-    requests: [
+    contents: [
       {
-        image: { source: { imageUri } },
-        features: [
-          { type: "LABEL_DETECTION", maxResults: 6 },
-          { type: "OBJECT_LOCALIZATION", maxResults: 8 },
-          { type: "TEXT_DETECTION", maxResults: 4 },
+        role: "user",
+        parts: [
+          { text: prompt },
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: imageBase64,
+            },
+          },
         ],
       },
     ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 240,
+    },
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(reqBody),
-  });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(reqBody),
+    },
+    30000,
+  );
 
+  const body = (await res.json().catch(() => ({}))) as Json;
   if (!res.ok) {
-    const errBody = (await res.json().catch(() => ({}))) as Json;
-    const errMsg = extractGoogleErrorMessage(errBody) || `HTTP ${res.status}`;
-    return {
-      responses: [
-        {
-          error: {
-            code: res.status,
-            message: errMsg,
-          },
-        },
-      ],
-    };
+    const errMsg = extractGoogleErrorMessage(body) || `HTTP ${res.status}`;
+    throw new Error(`Gemini 失敗：${errMsg}`);
   }
 
-  return (await res.json()) as Json;
+  const candidates = Array.isArray(body.candidates) ? (body.candidates as Json[]) : [];
+  const first = candidates[0] || {};
+  const content = (first.content || {}) as Json;
+  const parts = Array.isArray(content.parts) ? (content.parts as Json[]) : [];
+  const text = parts.map((p) => String(p.text || "").trim()).filter(Boolean).join("\n").trim();
+  if (!text) {
+    throw new Error("Gemini 回傳內容為空");
+  }
+  return text;
 }
 
 function extractGoogleErrorMessage(payload: Json): string {
@@ -907,41 +2955,6 @@ function extractGoogleErrorMessage(payload: Json): string {
   return "";
 }
 
-function getVisionErrorMessage(vision: Json): string {
-  const responses = Array.isArray(vision.responses) ? (vision.responses as Json[]) : [];
-  const first = responses[0] || {};
-  const err = (first.error || {}) as Json;
-  const code = Number(err.code || 0);
-  const message = String(err.message || "").trim();
-  if (code >= 400) {
-    return message || `HTTP ${code}`;
-  }
-  return "";
-}
-
-function extractVisionText(vision: Json): string {
-  const responses = Array.isArray(vision.responses) ? (vision.responses as Json[]) : [];
-  const first = responses[0] || {};
-  const errMsg = getVisionErrorMessage(vision);
-  if (errMsg) {
-    return `Vision 失敗：${errMsg}`;
-  }
-  const labels = Array.isArray(first.labelAnnotations)
-    ? (first.labelAnnotations as Json[])
-        .slice(0, 4)
-        .map((it) => String(it.description || "").trim())
-        .filter(Boolean)
-    : [];
-  const objects = Array.isArray(first.localizedObjectAnnotations)
-    ? (first.localizedObjectAnnotations as Json[])
-        .slice(0, 4)
-        .map((it) => String(it.name || "").trim())
-        .filter(Boolean)
-    : [];
-
-  const merged = [...new Set([...labels, ...objects])].slice(0, 6);
-  return merged.length ? `偵測到：${merged.join("、")}` : "未偵測到明確景物";
-}
 
 async function getOrCreateCached(
   env: Env,
@@ -949,36 +2962,74 @@ async function getOrCreateCached(
   payload: Json,
   creator: () => Promise<Json>,
   ttlSeconds: number,
-): Promise<{ data: Json; cacheHit: boolean }> {
+  options?: {
+    ctx?: ExecutionContext;
+    staleWhileRevalidateSeconds?: number;
+  },
+): Promise<{ data: Json; cacheHit: boolean; stale?: boolean }> {
   const cacheKey = await buildCacheKey(provider, payload);
 
   const edgeReq = new Request(`https://cache.local/${provider}/${cacheKey}`);
-  const edgeHit = await caches.default.match(edgeReq);
+  const edgeHit = await getEdgeCache().match(edgeReq);
   if (edgeHit) {
     const data = (await edgeHit.json()) as Json;
     return { data, cacheHit: true };
   }
 
   const now = nowEpoch();
+  const staleWhileRevalidateSeconds = Math.max(0, Number(options?.staleWhileRevalidateSeconds || 0));
   const row = await env.DB.prepare(
     "SELECT object_key, expires_at FROM api_cache WHERE cache_key = ?1 AND provider = ?2 LIMIT 1",
   )
     .bind(cacheKey, provider)
     .first<{ object_key: string; expires_at: number }>();
 
-  if (row && row.expires_at > now) {
+  if (row) {
     const obj = await env.CACHE_BUCKET.get(row.object_key);
     if (obj) {
       const data = (await obj.json()) as Json;
       await env.DB.prepare("UPDATE api_cache SET last_access_at = ?1 WHERE cache_key = ?2").bind(now, cacheKey).run();
       await writeEdgeCache(edgeReq, data);
-      return { data, cacheHit: true };
+
+      if (row.expires_at > now) {
+        return { data, cacheHit: true };
+      }
+
+      const staleFor = now - row.expires_at;
+      if (staleFor <= staleWhileRevalidateSeconds) {
+        if (options?.ctx) {
+          options.ctx.waitUntil(
+            (async () => {
+              const fresh = await creator();
+              await persistCachedValue(env, provider, cacheKey, payload, fresh, nowEpoch() + ttlSeconds, nowEpoch());
+              await writeEdgeCache(edgeReq, fresh);
+            })(),
+          );
+        }
+        return { data, cacheHit: true, stale: true };
+      }
     }
   }
 
   const data = await creator();
-  const expiresAt = now + ttlSeconds;
+  await persistCachedValue(env, provider, cacheKey, payload, data, now + ttlSeconds, now);
+
+  await writeEdgeCache(edgeReq, data);
+
+  return { data, cacheHit: false };
+}
+
+async function persistCachedValue(
+  env: Env,
+  provider: string,
+  cacheKey: string,
+  payload: Json,
+  data: Json,
+  expiresAt: number,
+  now: number,
+): Promise<void> {
   const objectKey = `${provider}/${cacheKey}.json`;
+  const cacheMeta = stableStringify(payload);
 
   await env.CACHE_BUCKET.put(objectKey, JSON.stringify(data), {
     httpMetadata: {
@@ -988,20 +3039,17 @@ async function getOrCreateCached(
   });
 
   await env.DB.prepare(
-    `INSERT INTO api_cache (cache_key, provider, object_key, expires_at, created_at, last_access_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+    `INSERT INTO api_cache (cache_key, provider, object_key, expires_at, created_at, last_access_at, cache_meta)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
      ON CONFLICT(cache_key) DO UPDATE SET
        provider = excluded.provider,
        object_key = excluded.object_key,
        expires_at = excluded.expires_at,
-       last_access_at = excluded.last_access_at`,
+       last_access_at = excluded.last_access_at,
+       cache_meta = excluded.cache_meta`,
   )
-    .bind(cacheKey, provider, objectKey, expiresAt, now)
+    .bind(cacheKey, provider, objectKey, expiresAt, now, cacheMeta)
     .run();
-
-  await writeEdgeCache(edgeReq, data);
-
-  return { data, cacheHit: false };
 }
 
 async function writeEdgeCache(req: Request, data: Json): Promise<void> {
@@ -1011,18 +3059,319 @@ async function writeEdgeCache(req: Request, data: Json): Promise<void> {
       "cache-control": `public, max-age=${CACHE_MAX_AGE_SECONDS}`,
     },
   });
-  await caches.default.put(req, res);
+  await getEdgeCache().put(req, res);
 }
 
 async function recordBilling(
   env: Env,
-  args: { provider: string; cacheHit: number; estimatedUsd: number; actualUsd: number },
+  args: { provider: string; cacheHit: number; estimatedUsd: number; actualUsd: number; userId?: string },
 ): Promise<void> {
+  const userId = args.userId || "anonymous";
   await env.DB.prepare(
     "INSERT INTO billing_events (user_id, provider, cache_hit, estimated_usd, actual_usd, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
   )
-    .bind("anonymous", args.provider, args.cacheHit, args.estimatedUsd, args.actualUsd, nowEpoch())
+    .bind(userId, args.provider, args.cacheHit, args.estimatedUsd, args.actualUsd, nowEpoch())
     .run();
+}
+
+// ── New API handlers ───────────────────────────────────────────────────────
+async function handleMe(request: Request, env: Env): Promise<Response> {
+  const secretKey = env.CLERK_SECRET_KEY || "";
+  const host = new URL(request.url).hostname.toLowerCase();
+  const isDev = host === "127.0.0.1" || host === "localhost";
+  if (isDev && !secretKey) {
+    return json({ signedIn: true, approved: true, email: "dev@local", isAdmin: true });
+  }
+  const authHeader = request.headers.get("Authorization") || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return json({ signedIn: false, approved: false });
+  }
+  const token = authHeader.slice(7);
+  const verified = await verifyClerkToken(token);
+  if (!verified) {
+    return json({ signedIn: false, approved: false });
+  }
+  if (!secretKey) {
+    return json({ signedIn: true, approved: false, email: "" });
+  }
+  const meta = await getClerkUserMeta(verified.userId, secretKey);
+  return json({ signedIn: true, approved: meta.approved, email: meta.email, isAdmin: meta.isAdmin });
+}
+
+async function handleBillingSummary(request: Request, env: Env): Promise<Response> {
+  const user = await requireClerkAuth(request, env);
+  await ensureD1Schema(env);
+
+  const total = await env.DB.prepare(
+    "SELECT COUNT(*) AS events, COALESCE(SUM(estimated_usd), 0) AS estimated, COALESCE(SUM(actual_usd), 0) AS actual FROM billing_events WHERE user_id = ?1",
+  )
+    .bind(user.userId)
+    .first<{ events: number; estimated: number; actual: number }>();
+
+  const byProviderRaw = await env.DB.prepare(
+    "SELECT provider, COUNT(*) AS events, COALESCE(SUM(estimated_usd),0) AS estimated, COALESCE(SUM(actual_usd),0) AS actual FROM billing_events WHERE user_id = ?1 GROUP BY provider ORDER BY actual DESC",
+  )
+    .bind(user.userId)
+    .all<{ provider: string; events: number; estimated: number; actual: number }>();
+
+  return json({
+    ok: true,
+    userId: user.userId,
+    totals: {
+      events: Number(total?.events || 0),
+      estimatedUsd: Number(total?.estimated || 0),
+      actualUsd: Number(total?.actual || 0),
+    },
+    byProvider: Array.isArray(byProviderRaw.results) ? byProviderRaw.results : [],
+  });
+}
+
+async function handleAdminListUsers(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  const secretKey = env.CLERK_SECRET_KEY || "";
+  if (!secretKey) throw new Error("Authentication not configured");
+  const res = await fetchWithTimeout(
+    "https://api.clerk.com/v1/users?limit=100&order_by=-created_at",
+    { headers: { Authorization: `Bearer ${secretKey}` } },
+    8000,
+  );
+  if (!res.ok) throw new Error(`Failed to list users`);
+  const users = (await res.json()) as Array<{
+    id: string;
+    email_addresses: Array<{ email_address: string }>;
+    public_metadata?: { approved?: boolean; role?: string };
+    created_at: number;
+  }>;
+  const result = users.map((u) => ({
+    userId: u.id,
+    email: u.email_addresses?.[0]?.email_address || "",
+    approved: u.public_metadata?.approved === true,
+    isAdmin: u.public_metadata?.role === "admin",
+    createdAt: u.created_at,
+  }));
+  return json({ ok: true, users: result });
+}
+
+async function handleAdminApproveUser(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  const body = await requireJson(request);
+  const targetUserId = String(body.userId || "").trim();
+  const approve = body.approve !== false;
+  if (!targetUserId) throw new Error("userId is required");
+  const secretKey = env.CLERK_SECRET_KEY || "";
+  if (!secretKey) throw new Error("Authentication not configured");
+  const res = await fetchWithTimeout(
+    `https://api.clerk.com/v1/users/${encodeURIComponent(targetUserId)}/metadata`,
+    {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ public_metadata: { approved: approve } }),
+    },
+    8000,
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to update user`);
+  }
+  // Invalidate edge cache for this user
+  await getEdgeCache().delete(new Request(`https://cache.local/clerk-user-meta/${targetUserId}`));
+  return json({ ok: true, userId: targetUserId, approved: approve });
+}
+
+async function handleAdminBillingSummary(request: Request, env: Env): Promise<Response> {
+  await requireAdminAuth(request, env);
+  await ensureD1Schema(env);
+
+  const rows = await env.DB.prepare(
+    "SELECT user_id, COUNT(*) AS events, COALESCE(SUM(estimated_usd),0) AS estimated, COALESCE(SUM(actual_usd),0) AS actual, MAX(created_at) AS last_event_at FROM billing_events GROUP BY user_id ORDER BY actual DESC",
+  ).all<{ user_id: string; events: number; estimated: number; actual: number; last_event_at: number }>();
+
+  const totals = await env.DB.prepare(
+    "SELECT COUNT(*) AS events, COALESCE(SUM(estimated_usd),0) AS estimated, COALESCE(SUM(actual_usd),0) AS actual FROM billing_events",
+  ).first<{ events: number; estimated: number; actual: number }>();
+
+  return json({
+    ok: true,
+    totals: {
+      events: Number(totals?.events || 0),
+      estimatedUsd: Number(totals?.estimated || 0),
+      actualUsd: Number(totals?.actual || 0),
+    },
+    users: Array.isArray(rows.results)
+      ? rows.results.map((r) => ({
+          userId: r.user_id,
+          events: Number(r.events || 0),
+          estimatedUsd: Number(r.estimated || 0),
+          actualUsd: Number(r.actual || 0),
+          lastEventAt: Number(r.last_event_at || 0),
+        }))
+      : [],
+  });
+}
+
+async function resolveRoadBBox(roadName: string, countryCode: string): Promise<{ bbox: BBox }> {
+  const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
+  let items: Array<Record<string, unknown>> = [];
+
+  if (normalizedCountry === "hk") {
+    const hkItems = await fetchNominatimSearch(roadName, "hk");
+    if (hkItems.length > 0) {
+      items = hkItems;
+    } else {
+      for (const q of [`香港${roadName}`, `Hong Kong ${roadName}`, roadName]) {
+        const cnItems = await fetchNominatimSearch(q, "cn");
+        if (cnItems.length > 0) {
+          items = cnItems;
+          break;
+        }
+      }
+    }
+  } else if (normalizedCountry) {
+    items = await fetchNominatimSearch(roadName, normalizedCountry);
+  } else {
+    items = await fetchNominatimSearch(roadName, "");
+  }
+
+  if (!items.length) {
+    throw new Error("Geocode no result for road name");
+  }
+
+  const first = items[0] || {};
+  const bb = Array.isArray(first.boundingbox) ? (first.boundingbox as string[]) : [];
+  let south = Number.NaN;
+  let north = Number.NaN;
+  let west = Number.NaN;
+  let east = Number.NaN;
+
+  if (bb.length === 4) {
+    south = Number(bb[0]);
+    north = Number(bb[1]);
+    west = Number(bb[2]);
+    east = Number(bb[3]);
+
+    const midLat = (south + north) / 2;
+    const midLon = (west + east) / 2;
+    const latHalf = Math.max(Math.abs(north - south) / 2, 0.005);
+    const lonHalf = Math.max(Math.abs(east - west) / 2, 0.005);
+    south = midLat - latHalf;
+    north = midLat + latHalf;
+    west = midLon - lonHalf;
+    east = midLon + lonHalf;
+  } else {
+    const lat = Number(first.lat);
+    const lon = Number(first.lon);
+    validateCoordinates(lat, lon);
+    const radius = 0.008;
+    south = lat - radius;
+    north = lat + radius;
+    west = lon - radius;
+    east = lon + radius;
+  }
+
+  return { bbox: { south, west, north, east } };
+}
+
+async function handleClerkWebhook(request: Request, env: Env): Promise<Response> {
+  const webhookSecret = env.CLERK_WEBHOOK_SECRET || "";
+  const rawBody = await request.text();
+  if (webhookSecret) {
+    const signatureOk = await verifySvixWebhook(request.headers, rawBody, webhookSecret);
+    if (!signatureOk) {
+      return json({ error: "Invalid webhook signature" }, 400);
+    }
+  }
+  const payload = JSON.parse(rawBody) as Json;
+  const eventType = String(payload.type || "");
+  if (eventType === "user.created") {
+    const userId = String((payload.data as Json)?.id || "");
+    if (userId && env.CLERK_SECRET_KEY) {
+      await fetchWithTimeout(
+        `https://api.clerk.com/v1/users/${encodeURIComponent(userId)}/metadata`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ public_metadata: { approved: false } }),
+        },
+        8000,
+      ).catch(() => null);
+    }
+  }
+  return json({ ok: true, event: eventType });
+}
+
+async function verifySvixWebhook(headers: Headers, body: string, secret: string): Promise<boolean> {
+  const svixId = String(headers.get("svix-id") || "").trim();
+  const svixTimestamp = String(headers.get("svix-timestamp") || "").trim();
+  const svixSignature = String(headers.get("svix-signature") || "").trim();
+  if (!svixId || !svixTimestamp || !svixSignature) {
+    return false;
+  }
+
+  const ts = Number.parseInt(svixTimestamp, 10);
+  if (!Number.isFinite(ts)) {
+    return false;
+  }
+  if (Math.abs(Date.now() / 1000 - ts) > WEBHOOK_MAX_SKEW_SECONDS) {
+    return false;
+  }
+
+  const cleanSecret = secret.startsWith("whsec_") ? secret.slice(6) : secret;
+  const keyBytes = base64Decode(cleanSecret);
+  if (!keyBytes) {
+    return false;
+  }
+  const keyBuffer = keyBytes.buffer.slice(
+    keyBytes.byteOffset,
+    keyBytes.byteOffset + keyBytes.byteLength,
+  ) as ArrayBuffer;
+
+  const payload = `${svixId}.${svixTimestamp}.${body}`;
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyBuffer,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signatureBytes = new Uint8Array(
+    await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(payload)),
+  );
+  const expected = bytesToBase64(signatureBytes);
+
+  const received = svixSignature
+    .split(" ")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const [ver, sig] = part.split(",");
+      if (ver !== "v1") return "";
+      return String(sig || "").trim();
+    })
+    .filter(Boolean);
+
+  return received.some((sig) => constantTimeEqual(sig, expected));
+}
+
+function base64Decode(value: string): Uint8Array | null {
+  try {
+    const binary = atob(value);
+    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let out = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return out === 0;
 }
 
 async function ensureD1Schema(env: Env): Promise<void> {
@@ -1041,6 +3390,12 @@ async function ensureD1Schema(env: Env): Promise<void> {
     "CREATE INDEX IF NOT EXISTS idx_api_cache_provider_expires ON api_cache(provider, expires_at)",
   ).run();
 
+  try {
+    await env.DB.prepare("ALTER TABLE api_cache ADD COLUMN cache_meta TEXT").run();
+  } catch {
+    // Column already exists in most environments.
+  }
+
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS billing_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1051,6 +3406,19 @@ async function ensureD1Schema(env: Env): Promise<void> {
       actual_usd REAL,
       created_at INTEGER NOT NULL
     )`,
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS rate_limits (
+      rate_key TEXT PRIMARY KEY,
+      count INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`,
+  ).run();
+
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_rate_limits_expires ON rate_limits(expires_at)",
   ).run();
 }
 
@@ -1080,6 +3448,14 @@ function nowEpoch(): number {
 
 function round6(v: number): number {
   return Math.round(v * 1_000_000) / 1_000_000;
+}
+
+function round5(v: number): number {
+  return Math.round(v * 100_000) / 100_000;
+}
+
+function round4(v: number): number {
+  return Math.round(v * 10_000) / 10_000;
 }
 
 function normalizeHeading(v: number): number {
@@ -1155,6 +3531,31 @@ function findTargetWays(allHighways: Way[], normRoadName: string, queryTokens: s
   });
 }
 
+function pickPrimaryRoadName(targetWays: Way[], fallback: string): string {
+  const counts = new Map<string, number>();
+
+  for (const way of targetWays) {
+    const names = collectWayNames(way.tags);
+    const preferred = names.find((name) => /[\u4e00-\u9fff]/.test(name)) || names[0] || "";
+    const clean = preferred.trim();
+    if (!clean) {
+      continue;
+    }
+    counts.set(clean, (counts.get(clean) || 0) + 1);
+  }
+
+  let best = fallback.trim();
+  let bestCount = -1;
+  for (const [name, count] of counts) {
+    if (count > bestCount) {
+      best = name;
+      bestCount = count;
+    }
+  }
+
+  return best || fallback;
+}
+
 function setEquals(a: Set<number>, b: Set<number>): boolean {
   if (a.size !== b.size) {
     return false;
@@ -1196,8 +3597,8 @@ function expandBBoxByConnectivity(
     return { bbox: base, changed: false, clamped: false };
   }
 
-  const latPad = Math.max((maxLat - minLat) * 0.15, 0.003);
-  const lonPad = Math.max((maxLon - minLon) * 0.15, 0.003);
+  const latPad = Math.max((maxLat - minLat) * 0.08, 0.0015);
+  const lonPad = Math.max((maxLon - minLon) * 0.08, 0.0015);
 
   let candidate: BBox = {
     south: Math.min(base.south, minLat - latPad),
@@ -1284,11 +3685,92 @@ function classifyIntersection(linkedWayCount: number): string {
   return "未知";
 }
 
-function dedupeIntersections(
-  rows: Array<{ id: number; lat: number; lon: number; name: string; crossStreets: string[]; type: string }>,
-): Array<{ id: number; lat: number; lon: number; name: string; crossStreets: string[]; type: string }> {
+function getWayDepartureBearings(
+  way: Way,
+  intersectionNodeId: number,
+  nodes: Map<number, { id: number; lat: number; lon: number; tags: Json }>,
+): number[] {
+  const bearings: number[] = [];
+
+  for (let i = 0; i < way.nodes.length; i += 1) {
+    if (way.nodes[i] !== intersectionNodeId) {
+      continue;
+    }
+
+    const current = nodes.get(intersectionNodeId);
+    const previous = i > 0 ? nodes.get(way.nodes[i - 1]) : null;
+    const next = i < way.nodes.length - 1 ? nodes.get(way.nodes[i + 1]) : null;
+
+    if (current && previous) {
+      bearings.push(bearingDegrees(current, previous));
+    }
+    if (current && next) {
+      bearings.push(bearingDegrees(current, next));
+    }
+  }
+
+  return [...new Set(bearings.map((bearing) => Math.round(normalizeHeading(bearing))))];
+}
+
+function resolveTurnCandidates(
+  candidates: Array<{ roadName: string; bearing: number }>,
+  forwardBearing: number | null,
+): { left: TurnCandidate | null; right: TurnCandidate | null } {
+  if (forwardBearing === null) {
+    return { left: null, right: null };
+  }
+
+  let left: TurnCandidate | null = null;
+  let right: TurnCandidate | null = null;
+
+  for (const candidate of candidates) {
+    const delta = signedBearingDelta(forwardBearing, candidate.bearing);
+    if (Math.abs(delta) < 25 || Math.abs(delta) > 155) {
+      continue;
+    }
+
+    const turn: TurnCandidate = {
+      roadName: candidate.roadName,
+      bearing: Math.round(normalizeHeading(candidate.bearing)),
+      direction: headingLabel(candidate.bearing),
+      delta: Math.round(delta),
+    };
+
+    if (delta < 0) {
+      if (!left || turnCandidateScore(turn) < turnCandidateScore(left)) {
+        left = turn;
+      }
+      continue;
+    }
+
+    if (!right || turnCandidateScore(turn) < turnCandidateScore(right)) {
+      right = turn;
+    }
+  }
+
+  return { left, right };
+}
+
+function signedBearingDelta(fromBearing: number, toBearing: number): number {
+  let delta = normalizeHeading(toBearing) - normalizeHeading(fromBearing);
+  if (delta > 180) {
+    delta -= 360;
+  }
+  if (delta <= -180) {
+    delta += 360;
+  }
+  return delta;
+}
+
+function turnCandidateScore(candidate: TurnCandidate): number {
+  return Math.abs(90 - Math.abs(candidate.delta));
+}
+
+function dedupeIntersections<T extends { id: number }>(
+  rows: T[],
+): T[] {
   const seen = new Set<number>();
-  const out: Array<{ id: number; lat: number; lon: number; name: string; crossStreets: string[]; type: string }> = [];
+  const out: T[] = [];
   for (const row of rows) {
     if (seen.has(row.id)) {
       continue;
