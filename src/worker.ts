@@ -128,6 +128,12 @@ export default {
     if (url.pathname === "/api/overpass/segment" && request.method === "POST") {
       return withErrorHandling(() => handleOverpassSegment(request, env, ctx));
     }
+    if (url.pathname === "/api/osm/tile" && request.method === "POST") {
+      return withErrorHandling(() => handleOsmTile(request, env, ctx));
+    }
+    if (url.pathname === "/api/osm/scan-nearby" && request.method === "POST") {
+      return withErrorHandling(() => handleOsmScanNearby(request, env, ctx));
+    }
     if (url.pathname === "/api/paid/places" && request.method === "POST") {
       return withErrorHandling(() => handlePaidPlaces(request, env, ctx));
     }
@@ -676,6 +682,251 @@ async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionC
   return json(cached.data);
 }
 
+async function handleOsmTile(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const zoom = Number(body.zoom ?? 16);
+  const x = Number(body.x);
+  const y = Number(body.y);
+
+  if (!Number.isInteger(zoom) || !Number.isInteger(x) || !Number.isInteger(y)) {
+    throw new Error("zoom, x, y must be integers");
+  }
+  if (zoom !== 16) {
+    throw new Error("Only zoom 16 is supported currently");
+  }
+
+  const tile = await getOrCreateOsmTile(env, ctx, zoom, x, y);
+  return json({ ok: true, ...tile });
+}
+
+async function handleOsmScanNearby(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(100, Math.min(2500, Number(body.radiusMeters ?? 1000)));
+  const zoom = Number(body.zoom ?? 16);
+
+  validateCoordinates(lat, lon);
+  if (!Number.isInteger(zoom) || zoom !== 16) {
+    throw new Error("Only zoom 16 is supported currently");
+  }
+
+  const latPad = metersToLatDegrees(radiusMeters);
+  const lonPad = metersToLonDegrees(radiusMeters, lat);
+  const south = lat - latPad;
+  const north = lat + latPad;
+  const west = lon - lonPad;
+  const east = lon + lonPad;
+
+  const min = lonLatToTileXY(north, west, zoom);
+  const max = lonLatToTileXY(south, east, zoom);
+
+  const tiles: Array<{ x: number; y: number }> = [];
+  for (let ty = Math.min(min.y, max.y); ty <= Math.max(min.y, max.y); ty += 1) {
+    for (let tx = Math.min(min.x, max.x); tx <= Math.max(min.x, max.x); tx += 1) {
+      tiles.push({ x: tx, y: ty });
+    }
+  }
+
+  const cappedTiles = tiles.slice(0, 64);
+  await Promise.all(cappedTiles.map((tile) => getOrCreateOsmTile(env, ctx, zoom, tile.x, tile.y)));
+
+  return json({
+    ok: true,
+    zoom,
+    lat: round6(lat),
+    lon: round6(lon),
+    radiusMeters,
+    scannedTiles: cappedTiles.length,
+    tiles: cappedTiles,
+  });
+}
+
+async function getOrCreateOsmTile(
+  env: Env,
+  ctx: ExecutionContext,
+  zoom: number,
+  x: number,
+  y: number,
+): Promise<Json> {
+  const cached = await getOrCreateCached(
+    env,
+    "osm-tile-v1",
+    { zoom, x, y, version: 1 },
+    async () => generateOsmTileData(zoom, x, y),
+    OSM_CACHE_TTL_SECONDS,
+    {
+      ctx,
+      staleWhileRevalidateSeconds: OSM_CACHE_STALE_SECONDS,
+    },
+  );
+  return cached.data;
+}
+
+async function generateOsmTileData(zoom: number, x: number, y: number): Promise<Json> {
+  const bbox = tileXYToBBox(zoom, x, y);
+  const overpassResult = await fetchOverpassPlaceJson(buildOsmTileQuery(bbox));
+  const parsed = parseOverpassData(overpassResult.data);
+  const features = buildTileFeatures(parsed, bbox);
+  return {
+    zoom,
+    x,
+    y,
+    bbox,
+    endpoint: overpassResult.endpoint,
+    featureCount: features.length,
+    type: "FeatureCollection",
+    features,
+  } as Json;
+}
+
+function buildOsmTileQuery(bbox: BBox): string {
+  return `
+[out:json][timeout:25];
+(
+  way["highway"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["highway"="crossing"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["entrance"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["amenity"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["shop"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["tourism"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  way["building"]["name"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+);
+out body tags;
+>;
+out skel qt;
+`;
+}
+
+function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
+  const features: Json[] = [];
+
+  for (const node of parsed.nodes.values()) {
+    if (!hasInterestingTileTags(node.tags)) {
+      continue;
+    }
+    const featureType = tileFeatureTypeForTags(node.tags);
+    features.push({
+      type: "Feature",
+      osm_ids: [node.id],
+      feature_type: featureType,
+      feature_value: String(node.tags.name || node.tags["name:zh"] || node.tags.amenity || node.tags.shop || node.tags.entrance || "yes"),
+      geometry: { type: "Point", coordinates: [round6(node.lon), round6(node.lat)] },
+      properties: node.tags,
+    } as Json);
+  }
+
+  const roadWays = parsed.ways.filter((way) => String(way.tags.highway || "").trim().length > 0);
+  for (const way of roadWays) {
+    const coords = way.nodes
+      .map((id) => parsed.nodes.get(id))
+      .filter(Boolean)
+      .map((n) => [round6((n as { lon: number }).lon), round6((n as { lat: number }).lat)]);
+    if (coords.length < 2) {
+      continue;
+    }
+    features.push({
+      type: "Feature",
+      osm_ids: [way.id],
+      feature_type: "highway",
+      feature_value: String(way.tags.highway || "road"),
+      geometry: { type: "LineString", coordinates: coords },
+      properties: way.tags,
+    } as Json);
+  }
+
+  const buildingWays = parsed.ways.filter((way) => String(way.tags.building || "").trim().length > 0 && String(way.tags.name || way.tags["name:zh"] || "").trim().length > 0);
+  for (const way of buildingWays) {
+    const coords = way.nodes
+      .map((id) => parsed.nodes.get(id))
+      .filter(Boolean)
+      .map((n) => [round6((n as { lon: number }).lon), round6((n as { lat: number }).lat)]);
+    if (coords.length < 3) {
+      continue;
+    }
+    const isClosed = coords.length > 3 && coords[0][0] === coords[coords.length - 1][0] && coords[0][1] === coords[coords.length - 1][1];
+    features.push({
+      type: "Feature",
+      osm_ids: [way.id],
+      feature_type: "building",
+      feature_value: String(way.tags["name:zh"] || way.tags.name || way.tags.building || "building"),
+      geometry: isClosed
+        ? { type: "Polygon", coordinates: [coords] }
+        : { type: "LineString", coordinates: coords },
+      properties: way.tags,
+    } as Json);
+  }
+
+  const nodeUsage = new Map<number, number>();
+  for (const way of roadWays) {
+    for (const nid of way.nodes) {
+      nodeUsage.set(nid, (nodeUsage.get(nid) || 0) + 1);
+    }
+  }
+  for (const [nid, count] of nodeUsage) {
+    if (count <= 1) {
+      continue;
+    }
+    const node = parsed.nodes.get(nid);
+    if (!node) {
+      continue;
+    }
+    if (node.lat < bbox.south || node.lat > bbox.north || node.lon < bbox.west || node.lon > bbox.east) {
+      continue;
+    }
+    features.push({
+      type: "Feature",
+      osm_ids: [nid],
+      feature_type: "highway",
+      feature_value: "gd_intersection",
+      geometry: { type: "Point", coordinates: [round6(node.lon), round6(node.lat)] },
+      properties: {},
+    } as Json);
+  }
+
+  return features;
+}
+
+function hasInterestingTileTags(tags: Json): boolean {
+  return Boolean(
+    tags.amenity || tags.shop || tags.tourism || tags.entrance ||
+    tags["public_transport"] || tags.railway || tags.highway === "crossing",
+  );
+}
+
+function tileFeatureTypeForTags(tags: Json): string {
+  if (tags.entrance) return "gd_entrance_list";
+  if (tags.amenity || tags.shop || tags.tourism) return "place";
+  if (tags.railway || tags["public_transport"]) return "transit";
+  if (tags.highway === "crossing") return "crossing";
+  return "place";
+}
+
+function lonLatToTileXY(lat: number, lon: number, zoom: number): { x: number; y: number } {
+  const n = 2 ** zoom;
+  const latRad = (lat * Math.PI) / 180;
+  const x = Math.floor(((lon + 180) / 360) * n);
+  const y = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
+  return { x, y };
+}
+
+function tileXToLon(x: number, zoom: number): number {
+  return (x / (2 ** zoom)) * 360 - 180;
+}
+
+function tileYToLat(y: number, zoom: number): number {
+  const n = Math.PI - (2 * Math.PI * y) / (2 ** zoom);
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+function tileXYToBBox(zoom: number, x: number, y: number): BBox {
+  const north = tileYToLat(y, zoom);
+  const south = tileYToLat(y + 1, zoom);
+  const west = tileXToLon(x, zoom);
+  const east = tileXToLon(x + 1, zoom);
+  return { south, west, north, east };
+}
+
 async function fetchOverpassJson(query: string): Promise<{ data: Json; endpoint: string }> {
   return fetchOverpassJsonWithEndpoints(
     query,
@@ -1106,7 +1357,9 @@ function buildOsmBBoxPlaceQuery(bbox: BBox): string {
 (
 ${buildOsmPlaceStatements(`(${bbox.south},${bbox.west},${bbox.north},${bbox.east})`)}
 );
-out center tags;
+out body tags;
+>;
+out skel qt;
 `;
 }
 
@@ -1149,10 +1402,23 @@ function buildOsmPlaceStatements(selector: string): string {
 
 function parseOsmPlaceCandidates(overpass: Json): OsmPlaceCandidate[] {
   const elements = Array.isArray(overpass.elements) ? (overpass.elements as Json[]) : [];
+  const nodeLookup = new Map<number, { lat: number; lon: number }>();
+  for (const element of elements) {
+    if (String(element.type || "") !== "node") {
+      continue;
+    }
+    const id = Number(element.id);
+    const lat = Number(element.lat);
+    const lon = Number(element.lon);
+    if (Number.isFinite(id) && Number.isFinite(lat) && Number.isFinite(lon)) {
+      nodeLookup.set(id, { lat, lon });
+    }
+  }
+  const entranceBuildingNames = mapEntranceBuildingNames(elements);
   const rows: OsmPlaceCandidate[] = [];
 
   for (const element of elements) {
-    const row = buildOsmPlaceCandidate(element);
+    const row = buildOsmPlaceCandidate(element, nodeLookup, entranceBuildingNames);
     if (row) {
       rows.push(row);
     }
@@ -1161,12 +1427,27 @@ function parseOsmPlaceCandidates(overpass: Json): OsmPlaceCandidate[] {
   return rows;
 }
 
-function buildOsmPlaceCandidate(element: Json): OsmPlaceCandidate | null {
+function buildOsmPlaceCandidate(
+  element: Json,
+  nodeLookup: Map<number, { lat: number; lon: number }>,
+  entranceBuildingNames: Map<number, string>,
+): OsmPlaceCandidate | null {
   const type = String(element.type || "").trim();
   const center = (element.center || {}) as Json;
   const tags = (element.tags || {}) as Json;
-  const lat = type === "node" ? Number(element.lat) : Number(center.lat);
-  const lon = type === "node" ? Number(element.lon) : Number(center.lon);
+  const wayCenter = type === "way"
+    ? centerFromWayNodes(Array.isArray(element.nodes) ? (element.nodes as number[]) : [], nodeLookup)
+    : null;
+  const lat = type === "node"
+    ? Number(element.lat)
+    : Number.isFinite(Number(center.lat))
+      ? Number(center.lat)
+      : Number(wayCenter?.lat);
+  const lon = type === "node"
+    ? Number(element.lon)
+    : Number.isFinite(Number(center.lon))
+      ? Number(center.lon)
+      : Number(wayCenter?.lon);
 
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return null;
@@ -1180,6 +1461,7 @@ function buildOsmPlaceCandidate(element: Json): OsmPlaceCandidate | null {
   const houseNumber = String(tags["addr:housenumber"] || "").trim();
   const houseName = String(tags["addr:housename"] || "").trim();
   const addressLabel = formatStreetAddress(streetName, houseNumber, houseName);
+  const entranceBuildingName = type === "node" ? (entranceBuildingNames.get(Number(element.id)) || "") : "";
   const explicitName = String(tags["name:zh"] || tags.name || tags.brand || tags.operator || tags.ref || "").trim();
   const kindLabel = describeOsmKind(tags);
   const hasSpecificFeature = Boolean(
@@ -1188,7 +1470,7 @@ function buildOsmPlaceCandidate(element: Json): OsmPlaceCandidate | null {
     highwayVal === "bus_stop" || highwayVal === "crossing" ||
     tags.leisure || tags.landuse
   );
-  const title = explicitName || addressLabel || (hasSpecificFeature ? kindLabel : null);
+  const title = explicitName || (entranceBuildingName ? `${entranceBuildingName} 入口` : null) || addressLabel || (hasSpecificFeature ? kindLabel : null);
 
   if (!title) {
     return null;
@@ -1210,6 +1492,56 @@ function buildOsmPlaceCandidate(element: Json): OsmPlaceCandidate | null {
     hasExplicitName: Boolean(explicitName),
     hasFeatureTag: hasSpecificFeature,
   };
+}
+
+function mapEntranceBuildingNames(elements: Json[]): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const element of elements) {
+    if (String(element.type || "") !== "way") {
+      continue;
+    }
+    const tags = (element.tags || {}) as Json;
+    const building = String(tags.building || "").trim();
+    if (!building || building === "no") {
+      continue;
+    }
+    const name = String(tags["name:zh"] || tags.name || "").trim();
+    if (!name) {
+      continue;
+    }
+    const nodes = Array.isArray(element.nodes) ? (element.nodes as number[]) : [];
+    for (const nodeId of nodes) {
+      if (!map.has(nodeId)) {
+        map.set(nodeId, name);
+      }
+    }
+  }
+  return map;
+}
+
+function centerFromWayNodes(
+  nodeIds: number[],
+  nodeLookup: Map<number, { lat: number; lon: number }>,
+): { lat: number; lon: number } | null {
+  if (nodeIds.length === 0) {
+    return null;
+  }
+  let totalLat = 0;
+  let totalLon = 0;
+  let count = 0;
+  for (const nodeId of nodeIds) {
+    const node = nodeLookup.get(nodeId);
+    if (!node) {
+      continue;
+    }
+    totalLat += node.lat;
+    totalLon += node.lon;
+    count += 1;
+  }
+  if (count === 0) {
+    return null;
+  }
+  return { lat: totalLat / count, lon: totalLon / count };
 }
 
 function shouldIncludeIntersectionCrossWay(way: { tags: Json }): boolean {
