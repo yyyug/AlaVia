@@ -137,6 +137,9 @@ export default {
     if (url.pathname === "/api/osm/scan-nearby" && request.method === "POST") {
       return withErrorHandling(() => handleOsmScanNearby(request, env, ctx));
     }
+    if (url.pathname === "/api/osm/places-around" && request.method === "POST") {
+      return withErrorHandling(() => handleOsmPlacesAround(request, env, ctx));
+    }
     if (url.pathname === "/api/paid/places" && request.method === "POST") {
       return withErrorHandling(() => handlePaidPlaces(request, env, ctx));
     }
@@ -1145,6 +1148,75 @@ async function handleOsmRoutePlaces(request: Request, env: Env, ctx: ExecutionCo
   );
 
   return json(adaptOsmRoutePlacesForDirection(cached.data, canonicalSegment));
+}
+
+async function handleOsmPlacesAround(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(30, Math.min(300, Number(body.radiusMeters ?? 120)));
+  validateCoordinates(lat, lon);
+
+  const origin = { lat: round6(lat), lon: round6(lon) };
+  const cachePayload = {
+    lat: origin.lat,
+    lon: origin.lon,
+    radiusMeters: Math.round(radiusMeters),
+    version: 1,
+  };
+
+  const cached = await getOrCreateCached(
+    env,
+    "osm-places-around-v1",
+    cachePayload,
+    async () => {
+      const overpassResult = await fetchOverpassPlaceJson(buildOsmAroundPlaceQuery(origin.lat, origin.lon, radiusMeters));
+      const candidates = dedupeOsmPlaces(parseOsmPlaceCandidates(overpassResult.data));
+
+      const places = candidates
+        .map((place) => {
+          const distanceMeters = Math.round(haversineMeters(origin, place));
+          const bearing = Math.round(normalizeHeading(bearingDegrees(origin, place)));
+          return {
+            id: place.id,
+            title: place.title,
+            kindLabel: place.kindLabel,
+            addressLabel: place.addressLabel,
+            lat: round6(place.lat),
+            lon: round6(place.lon),
+            distanceMeters,
+            bearing,
+            direction: headingLabel(bearing),
+            hasExplicitName: place.hasExplicitName,
+            hasFeatureTag: place.hasFeatureTag,
+          };
+        })
+        .sort((a, b) => {
+          const aScore = a.distanceMeters + (a.hasExplicitName ? 0 : 20) + (a.hasFeatureTag ? 0 : 10);
+          const bScore = b.distanceMeters + (b.hasExplicitName ? 0 : 20) + (b.hasFeatureTag ? 0 : 10);
+          return aScore - bScore || a.distanceMeters - b.distanceMeters;
+        })
+        .slice(0, 24);
+
+      return {
+        ok: true,
+        provider: "osm-places-around",
+        endpoint: overpassResult.endpoint,
+        count: places.length,
+        lat: origin.lat,
+        lon: origin.lon,
+        radiusMeters: Math.round(radiusMeters),
+        places,
+      } as Json;
+    },
+    OSM_CACHE_TTL_SECONDS,
+    {
+      ctx,
+      staleWhileRevalidateSeconds: OSM_CACHE_STALE_SECONDS,
+    },
+  );
+
+  return json(cached.data);
 }
 
 function canonicalizeRouteSegment(
