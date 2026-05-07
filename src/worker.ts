@@ -128,6 +128,9 @@ export default {
     if (url.pathname === "/api/overpass/segment" && request.method === "POST") {
       return withErrorHandling(() => handleOverpassSegment(request, env, ctx));
     }
+    if (url.pathname === "/api/intersections/near" && request.method === "POST") {
+      return withErrorHandling(() => handleIntersectionsNear(request, env, ctx));
+    }
     if (url.pathname === "/api/osm/tile" && request.method === "POST") {
       return withErrorHandling(() => handleOsmTile(request, env, ctx));
     }
@@ -416,11 +419,42 @@ async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionC
   const body = await requireJson(request);
   const roadName = String(body.roadName || "").trim();
   const countryCode = String(body.countryCode || "").trim().toLowerCase();
-
   if (!roadName) {
     throw new Error("roadName is required");
   }
+  const data = await fetchSegmentData(env, ctx, roadName, countryCode);
+  return json(data);
+}
 
+// Combined endpoint: reverse-geocode lat/lon then return segment intersections in one round-trip.
+// Saves the iOS client from making two sequential calls (reverseRoad + overpassSegment).
+async function handleIntersectionsNear(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const countryCode = String(body.countryCode || "").trim().toLowerCase();
+  validateCoordinates(lat, lon);
+
+  const reverse = await fetchNominatimReverse(env, lat, lon, ctx);
+  const roadName = extractRoadNameFromGeocodeRecord(reverse, "");
+  if (!roadName) {
+    throw new Error("Could not determine road from coordinates");
+  }
+
+  const address = (reverse.address || {}) as Record<string, unknown>;
+  const resolvedCountry = countryCode || String(address.country_code || "").trim().toLowerCase();
+
+  const segmentData = await fetchSegmentData(env, ctx, roadName, resolvedCountry);
+  return json({
+    ...(segmentData as object),
+    lat: round6(lat),
+    lon: round6(lon),
+    displayName: String(reverse.display_name || roadName),
+    resolvedRoadName: roadName,
+  });
+}
+
+async function fetchSegmentData(env: Env, ctx: ExecutionContext, roadName: string, countryCode: string): Promise<Json> {
   await ensureD1Schema(env);
   // Cache key uses only normalized road name — no bbox — so repeated queries for
   // the same road always hit the same cache entry regardless of Nominatim variance.
@@ -679,7 +713,7 @@ async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionC
     },
   );
 
-  return json(cached.data);
+  return cached.data;
 }
 
 async function handleOsmTile(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
