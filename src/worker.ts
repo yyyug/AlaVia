@@ -1,7 +1,11 @@
+import { neon } from "@neondatabase/serverless";
+import { PMTiles, type RangeResponse, type Source } from "pmtiles";
+
 export interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
   CACHE_BUCKET: R2Bucket;
+  TILES_BUCKET?: R2Bucket;
   GOOGLE_MAPS_API_KEY?: string;
   GEMINI_API_KEY?: string;
   ALLOWED_ACCESS_EMAILS?: string;
@@ -9,6 +13,7 @@ export interface Env {
   CLERK_WEBHOOK_SECRET?: string;
   CLERK_JWT_AUDIENCE?: string;
   ALLOW_DEV_BYPASS?: string;
+  NEON_DSN?: string;
 }
 
 type Json = Record<string, unknown>;
@@ -79,12 +84,25 @@ type GoogleRoutePlaceCandidate = {
   distanceToLineMeters: number;
 };
 
+type SoundscapeTileFeature = {
+  type: string;
+  osm_ids: number[];
+  feature_type: string | null;
+  feature_value: string | null;
+  geometry: unknown;
+  properties: Record<string, unknown> | null;
+};
+
 const DAY = 60 * 60 * 24;
 const TTL_365_DAYS = 365 * DAY;
 const CACHE_MAX_AGE_SECONDS = DAY;
 const GEOCODE_TTL_SECONDS = 30 * DAY;
 const OSM_CACHE_TTL_SECONDS = TTL_365_DAYS;
 const OSM_CACHE_STALE_SECONDS = 30 * DAY;
+const TILE_HOT_CACHE_THRESHOLD = 3;
+const TILE_HOT_CACHE_TTL_SECONDS = 30 * DAY;
+const SOUNDSCAPE_TILE_MAX_AGE_SECONDS = 7 * DAY;
+const SOUNDSCAPE_HK_PMTILES_KEY = "pmtiles/hongkong-z16.pmtiles";
 const OVERPASS_TIMEOUT_MS = 30000;
 const OVERPASS_PLACE_TIMEOUT_MS = 15000;
 const OVERPASS_MAX_ITERATIONS = 2;
@@ -194,6 +212,15 @@ export default {
     }
     if (url.pathname === "/api/clerk/webhook" && request.method === "POST") {
       return withErrorHandling(() => handleClerkWebhook(request, env));
+    }
+
+    // ── SoundScape Tiles Routes ──────────────────────────────────────────
+    const tilesMatch = /^\/tiles\/(\d+)\/(\d+)\/(\d+)\.json$/.exec(url.pathname);
+    if (tilesMatch && request.method === "GET") {
+      const zoom = parseInt(tilesMatch[1], 10);
+      const x = parseInt(tilesMatch[2], 10);
+      const y = parseInt(tilesMatch[3], 10);
+      return withErrorHandling(() => handleTilesRequest(request, env, ctx, zoom, x, y));
     }
 
     return env.ASSETS.fetch(request);
@@ -827,7 +854,7 @@ function buildOsmTileQuery(bbox: BBox): string {
   node["amenity"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["shop"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["tourism"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
-  way["building"]["name"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  way["building"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
 );
 out body tags;
 >;
@@ -838,21 +865,35 @@ out skel qt;
 function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
   const features: Json[] = [];
 
+  // Collect all entrance nodes for later grouping with buildings
+  const entranceNodes = new Map<number, { id: number; lat: number; lon: number; tags: Json }>();
   for (const node of parsed.nodes.values()) {
+    if (node.tags.entrance) {
+      entranceNodes.set(node.id, node);
+    }
+  }
+
+  // Process POI nodes (exclude entrance nodes, which will be grouped into gd_entrance_list)
+  for (const node of parsed.nodes.values()) {
+    if (node.tags.entrance) {
+      continue; // Skip individual entrance nodes
+    }
     if (!hasInterestingTileTags(node.tags)) {
       continue;
     }
     const featureType = tileFeatureTypeForTags(node.tags);
+    const name = String(node.tags.name || node.tags["name:zh"] || node.tags.amenity || node.tags.shop || node.tags.tourism || "yes");
     features.push({
       type: "Feature",
       osm_ids: [node.id],
       feature_type: featureType,
-      feature_value: String(node.tags.name || node.tags["name:zh"] || node.tags.amenity || node.tags.shop || node.tags.entrance || "yes"),
+      feature_value: name,
       geometry: { type: "Point", coordinates: [round6(node.lon), round6(node.lat)] },
       properties: node.tags,
     } as Json);
   }
 
+  // Process road ways
   const roadWays = parsed.ways.filter((way) => String(way.tags.highway || "").trim().length > 0);
   for (const way of roadWays) {
     const coords = way.nodes
@@ -872,7 +913,8 @@ function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
     } as Json);
   }
 
-  const buildingWays = parsed.ways.filter((way) => String(way.tags.building || "").trim().length > 0 && String(way.tags.name || way.tags["name:zh"] || "").trim().length > 0);
+  // Process building ways
+  const buildingWays = parsed.ways.filter((way) => String(way.tags.building || "").trim().length > 0);
   for (const way of buildingWays) {
     const coords = way.nodes
       .map((id) => parsed.nodes.get(id))
@@ -882,18 +924,42 @@ function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
       continue;
     }
     const isClosed = coords.length > 3 && coords[0][0] === coords[coords.length - 1][0] && coords[0][1] === coords[coords.length - 1][1];
+    
+    // Generate building name
+    const buildingName = String(way.tags["name:zh"] || way.tags.name || way.tags.building || "building");
+    
     features.push({
       type: "Feature",
       osm_ids: [way.id],
       feature_type: "building",
-      feature_value: String(way.tags["name:zh"] || way.tags.name || way.tags.building || "building"),
+      feature_value: buildingName,
       geometry: isClosed
         ? { type: "Polygon", coordinates: [coords] }
         : { type: "LineString", coordinates: coords },
       properties: way.tags,
     } as Json);
+
+    // Create gd_entrance_list for buildings with nearby entrances
+    if (entranceNodes.size > 0) {
+      const buildingEntrances = findNearbyEntrances(way.nodes, parsed.nodes, entranceNodes, 0.0001); // ~10m at equator
+      if (buildingEntrances.length > 0) {
+        const entranceCoords = buildingEntrances.map((e) => [round6(e.lon), round6(e.lat)]);
+        const osmIds = [way.id, ...buildingEntrances.map((e) => e.id)];
+        features.push({
+          type: "Feature",
+          osm_ids: osmIds,
+          feature_type: "gd_entrance_list",
+          feature_value: "yes",
+          geometry: buildingEntrances.length === 1
+            ? { type: "Point", coordinates: entranceCoords[0] }
+            : { type: "MultiPoint", coordinates: entranceCoords },
+          properties: {},
+        } as Json);
+      }
+    }
   }
 
+  // Calculate road intersections
   const nodeUsage = new Map<number, number>();
   for (const way of roadWays) {
     for (const nid of way.nodes) {
@@ -924,15 +990,45 @@ function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
   return features;
 }
 
+function findNearbyEntrances(
+  buildingNodeIds: number[],
+  nodes: Map<number, { id: number; lat: number; lon: number; tags: Json }>,
+  entranceNodes: Map<number, { id: number; lat: number; lon: number; tags: Json }>,
+  proximityThreshold: number,
+): { id: number; lat: number; lon: number }[] {
+  const buildingCoords = buildingNodeIds
+    .map((id) => nodes.get(id))
+    .filter(Boolean)
+    .map((n) => ({ lat: (n as any).lat, lon: (n as any).lon }));
+
+  if (buildingCoords.length === 0) {
+    return [];
+  }
+
+  // Calculate building centroid
+  const centroidLat = buildingCoords.reduce((sum, c) => sum + c.lat, 0) / buildingCoords.length;
+  const centroidLon = buildingCoords.reduce((sum, c) => sum + c.lon, 0) / buildingCoords.length;
+
+  // Find entrances within proximity threshold
+  const nearby: { id: number; lat: number; lon: number }[] = [];
+  for (const entrance of entranceNodes.values()) {
+    const latDiff = Math.abs(entrance.lat - centroidLat);
+    const lonDiff = Math.abs(entrance.lon - centroidLon);
+    if (latDiff < proximityThreshold && lonDiff < proximityThreshold) {
+      nearby.push({ id: entrance.id, lat: entrance.lat, lon: entrance.lon });
+    }
+  }
+  return nearby;
+}
+
 function hasInterestingTileTags(tags: Json): boolean {
   return Boolean(
-    tags.amenity || tags.shop || tags.tourism || tags.entrance ||
+    tags.amenity || tags.shop || tags.tourism ||
     tags["public_transport"] || tags.railway || tags.highway === "crossing",
   );
 }
 
 function tileFeatureTypeForTags(tags: Json): string {
-  if (tags.entrance) return "gd_entrance_list";
   if (tags.amenity || tags.shop || tags.tourism) return "place";
   if (tags.railway || tags["public_transport"]) return "transit";
   if (tags.highway === "crossing") return "crossing";
@@ -3792,6 +3888,285 @@ async function verifySvixWebhook(headers: Headers, body: string, secret: string)
   return received.some((sig) => constantTimeEqual(sig, expected));
 }
 
+// ── SoundScape Tiles Handler (PMTiles + Neon PostGIS) ──────────────────
+/**
+ * Handles tile requests at /tiles/{zoom}/{x}/{y}.json
+ * 
+ * Strategy:
+ * 1. Hong Kong (zoom 16): Try R2 PMTiles first (pre-generated)
+ * 2. Other regions (zoom 16): Query Neon PostGIS on-demand + cache to R2
+ * 3. Other zooms: Not supported currently (return 404)
+ * 
+ * Each tile response is GeoJSON FeatureCollection compatible with SoundScape iOS app.
+ */
+async function handleTilesRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  zoom: number,
+  x: number,
+  y: number,
+): Promise<Response> {
+  if (zoom !== 16) {
+    return json({ error: `Zoom ${zoom} not supported` }, 404);
+  }
+  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0) {
+    return json({ error: "Invalid tile coordinates" }, 400);
+  }
+
+  const cachedTile = await fetchCachedTileFromR2(env, zoom, x, y);
+  if (cachedTile) {
+    if (hasTileFeatures(cachedTile.tile)) {
+      return buildSoundscapeTileResponse(request, cachedTile.tile, "r2-hot-cache", SOUNDSCAPE_TILE_MAX_AGE_SECONDS, cachedTile.etag);
+    }
+  }
+
+  const pmtilesTile = await fetchPMTilesFromR2(env, zoom, x, y);
+  if (pmtilesTile) {
+    if (hasTileFeatures(pmtilesTile)) {
+      return buildSoundscapeTileResponse(request, pmtilesTile, "r2-pmtiles", SOUNDSCAPE_TILE_MAX_AGE_SECONDS);
+    }
+  }
+
+  try {
+    const tile = await fetchTileFromNeon(env, zoom, x, y);
+    if (tile && hasTileFeatures(tile)) {
+      ctx.waitUntil(recordTileAccessAndMaybeCache(env, zoom, x, y, tile));
+      return buildSoundscapeTileResponse(request, tile, "neon-postgis", 300);
+    }
+  } catch (err) {
+    console.error(`Neon PostGIS fetch failed for tile ${zoom}/${x}/${y}:`, err);
+  }
+
+  // Fallback for regions not covered by PMTiles/Neon: generate SoundScape-compatible
+  // tile content directly from live OSM data so app callouts still receive entities.
+  try {
+    const fallbackTile = await generateOsmSoundscapeTile(zoom, x, y);
+    if (hasTileFeatures(fallbackTile)) {
+      ctx.waitUntil(recordTileAccessAndMaybeCache(env, zoom, x, y, fallbackTile));
+      return buildSoundscapeTileResponse(request, fallbackTile, "overpass-fallback", 1800);
+    }
+  } catch (err) {
+    console.error(`Overpass fallback failed for tile ${zoom}/${x}/${y}:`, err);
+  }
+
+  const emptyTile = {
+    type: 'FeatureCollection',
+    features: [],
+    warning: 'No tile data available for this region'
+  } as Json;
+  return buildSoundscapeTileResponse(request, emptyTile, "empty", 120);
+}
+
+class R2PMTilesSource implements Source {
+  constructor(private readonly bucket: R2Bucket, private readonly key: string) {}
+
+  getKey(): string {
+    return `r2://${this.key}`;
+  }
+
+  async getBytes(offset: number, length: number, _signal?: AbortSignal, etag?: string): Promise<RangeResponse> {
+    const object = await this.bucket.get(this.key, {
+      onlyIf: etag ? { etagMatches: etag } : undefined,
+      range: { offset, length },
+    });
+    if (!object) {
+      throw new Error(`PMTiles archive not found: ${this.key}`);
+    }
+
+    const data = await object.arrayBuffer();
+    return {
+      data,
+      etag: object.httpEtag,
+      cacheControl: object.httpMetadata?.cacheControl,
+      expires: object.httpMetadata?.cacheExpiry?.toUTCString(),
+    };
+  }
+}
+
+const pmtilesArchiveCache = new Map<string, PMTiles>();
+
+function getPMTilesArchive(env: Env, key: string): PMTiles | null {
+  if (!env.TILES_BUCKET) {
+    return null;
+  }
+
+  const cached = pmtilesArchiveCache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  const archive = new PMTiles(new R2PMTilesSource(env.TILES_BUCKET, key));
+  pmtilesArchiveCache.set(key, archive);
+  return archive;
+}
+
+async function fetchCachedTileFromR2(env: Env, zoom: number, x: number, y: number): Promise<{ tile: Json; etag: string | null } | null> {
+  if (!env.TILES_BUCKET) {
+    return null;
+  }
+
+  const key = `tiles/${zoom}/${x}/${y}.json`;
+  const object = await env.TILES_BUCKET.get(key);
+  if (!object) {
+    return null;
+  }
+
+  return {
+    tile: (await object.json()) as Json,
+    etag: object.httpEtag ?? null,
+  };
+}
+
+async function fetchPMTilesFromR2(env: Env, zoom: number, x: number, y: number): Promise<Json | null> {
+  const archive = getPMTilesArchive(env, SOUNDSCAPE_HK_PMTILES_KEY);
+  if (!archive) {
+    return null;
+  }
+
+  try {
+    const tile = await archive.getZxy(zoom, x, y);
+    if (!tile) {
+      return null;
+    }
+
+    return parseTilePayload(tile.data);
+  } catch (err) {
+    console.error(`R2 PMTiles fetch error for tile ${zoom}/${x}/${y}:`, err);
+    return null;
+  }
+}
+
+function parseTilePayload(data: ArrayBuffer): Json {
+  const text = new TextDecoder().decode(new Uint8Array(data));
+  return JSON.parse(text) as Json;
+}
+
+async function fetchTileFromNeon(env: Env, zoom: number, x: number, y: number): Promise<Json | null> {
+  const dsn = String(env.NEON_DSN || "").trim();
+  if (!dsn) {
+    return null;
+  }
+
+  const sql = neon(dsn, { fetchOptions: { cache: "no-store" } });
+  const rows = await sql`
+    SELECT type, osm_ids, feature_type, feature_value, geometry, properties
+    FROM soundscape_tile(${zoom}, ${x}, ${y})
+  ` as SoundscapeTileFeature[];
+
+  const features = Array.isArray(rows)
+    ? rows.map((row) => ({
+        type: row.type || "Feature",
+        osm_ids: Array.isArray(row.osm_ids) ? row.osm_ids : [],
+        feature_type: row.feature_type || null,
+        feature_value: row.feature_value || null,
+        geometry: row.geometry,
+        properties: row.properties || {},
+      }))
+    : [];
+
+  return {
+    type: "FeatureCollection",
+    features,
+  } as Json;
+}
+
+async function recordTileAccessAndMaybeCache(env: Env, zoom: number, x: number, y: number, tile: Json): Promise<void> {
+  await ensureD1Schema(env);
+
+  const key = `${zoom}/${x}/${y}`;
+  const now = nowEpoch();
+  const row = await env.DB.prepare(
+    `INSERT INTO tile_access (tile_key, hits, first_seen_at, last_seen_at, cached_at)
+     VALUES (?1, 1, ?2, ?2, NULL)
+     ON CONFLICT(tile_key) DO UPDATE SET
+       hits = hits + 1,
+       last_seen_at = excluded.last_seen_at
+     RETURNING hits, cached_at`,
+  ).bind(key, now).first<{ hits: number; cached_at: number | null }>();
+
+  const hits = Number(row?.hits || 0);
+  const cachedAt = row?.cached_at ?? null;
+  if (cachedAt || hits < TILE_HOT_CACHE_THRESHOLD) {
+    return;
+  }
+
+  await cacheHotTileToR2(env, zoom, x, y, tile);
+  await env.DB.prepare(
+    "UPDATE tile_access SET cached_at = ?2 WHERE tile_key = ?1",
+  ).bind(key, now).run();
+}
+
+async function cacheHotTileToR2(env: Env, zoom: number, x: number, y: number, tile: Json): Promise<void> {
+  if (!env.TILES_BUCKET) {
+    return;
+  }
+
+  const key = `tiles/${zoom}/${x}/${y}.json`;
+  await env.TILES_BUCKET.put(key, JSON.stringify(tile), {
+    httpMetadata: {
+      contentType: "application/json",
+      cacheControl: `public, max-age=${TILE_HOT_CACHE_TTL_SECONDS}`,
+    },
+  });
+}
+
+async function generateTileETag(tile: Json): Promise<string> {
+  const hash = await buildCacheKey("soundscape-tile-etag-v1", tile);
+  return `"${hash}"`;
+}
+
+function hasTileFeatures(tile: Json): boolean {
+  const features = Array.isArray(tile.features) ? (tile.features as unknown[]) : [];
+  return features.length > 0;
+}
+
+async function generateOsmSoundscapeTile(zoom: number, x: number, y: number): Promise<Json> {
+  const tile = await generateOsmTileData(zoom, x, y);
+  const features = Array.isArray(tile.features) ? (tile.features as Json[]) : [];
+
+  const normalized = features.map((feature) => ({
+    type: String(feature.type || "Feature"),
+    osm_ids: Array.isArray(feature.osm_ids) ? feature.osm_ids : [],
+    feature_type: feature.feature_type ?? null,
+    feature_value: feature.feature_value ?? null,
+    geometry: feature.geometry ?? null,
+    properties: (feature.properties as Json) || {},
+  }));
+
+  return {
+    type: "FeatureCollection",
+    features: normalized,
+  } as Json;
+}
+
+async function buildSoundscapeTileResponse(request: Request, tile: Json, source: string, maxAgeSeconds: number, explicitEtag: string | null = null): Promise<Response> {
+  const etag = explicitEtag || await generateTileETag(tile);
+  const ifNoneMatch = String(request.headers.get("if-none-match") || "").trim();
+
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        "Cache-Control": `public, max-age=${maxAgeSeconds}, stale-while-revalidate=${DAY}`,
+        "ETag": etag,
+        "Access-Control-Allow-Origin": "*",
+        "X-Tile-Source": source,
+      },
+    });
+  }
+
+  return new Response(JSON.stringify(tile), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${maxAgeSeconds}, stale-while-revalidate=${DAY}`,
+      "ETag": etag,
+      "Access-Control-Allow-Origin": "*",
+      "X-Tile-Source": source,
+    },
+  });
+}
+
 function base64Decode(value: string): Uint8Array | null {
   try {
     const binary = atob(value);
@@ -3857,6 +4232,20 @@ async function ensureD1Schema(env: Env): Promise<void> {
 
   await env.DB.prepare(
     "CREATE INDEX IF NOT EXISTS idx_rate_limits_expires ON rate_limits(expires_at)",
+  ).run();
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS tile_access (
+      tile_key TEXT PRIMARY KEY,
+      hits INTEGER NOT NULL,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      cached_at INTEGER
+    )`,
+  ).run();
+
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_tile_access_cached_hits ON tile_access(cached_at, hits)",
   ).run();
 }
 
