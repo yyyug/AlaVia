@@ -138,6 +138,8 @@ const I18N = {
     indoorDescribeResult: "室內環境描述：{text}",
     indoorMoveBy: "往{direction}移動 {meters}m",
     indoorMoveDone: "已往{direction}移動約 {meters}m",
+    indoorLowConfidenceManual: "室內導覽信心較低，請改以街景圖片與方向按鈕人工判讀。",
+    indoorNeedManual: "目前無法可靠判斷下一步，請人工判讀。",
   },
   en: {
     title: "AlaVia Text Navigation",
@@ -239,6 +241,8 @@ const I18N = {
     indoorDescribeResult: "Indoor surroundings: {text}",
     indoorMoveBy: "Move {meters}m to {direction}",
     indoorMoveDone: "Moved about {meters}m to {direction}",
+    indoorLowConfidenceManual: "Indoor navigation confidence is low. Please decide manually using Street View images and direction buttons.",
+    indoorNeedManual: "Cannot reliably determine the next indoor step. Please decide manually.",
   },
   ja: {
     title: "AlaVia テキスト地図ナビ",
@@ -340,6 +344,8 @@ const I18N = {
     indoorDescribeResult: "室内環境: {text}",
     indoorMoveBy: "{direction}へ {meters}m 移動",
     indoorMoveDone: "{direction}へ約 {meters}m 移動しました",
+    indoorLowConfidenceManual: "屋内ナビの信頼度が低いため、Street View画像と方向ボタンで手動判断してください。",
+    indoorNeedManual: "次の屋内ステップを信頼して判定できません。手動で判断してください。",
   },
   ko: {
     title: "AlaVia 텍스트 지도 내비",
@@ -441,6 +447,8 @@ const I18N = {
     indoorDescribeResult: "실내 환경: {text}",
     indoorMoveBy: "{direction} 방향으로 {meters}m 이동",
     indoorMoveDone: "{direction} 방향으로 약 {meters}m 이동했습니다",
+    indoorLowConfidenceManual: "실내 안내 신뢰도가 낮습니다. Street View 이미지와 방향 버튼으로 수동 판단해 주세요.",
+    indoorNeedManual: "다음 실내 이동을 신뢰성 있게 판단할 수 없습니다. 수동으로 판단해 주세요.",
   },
 };
 
@@ -1254,36 +1262,90 @@ async function moveQuickIndoorByBearing(bearing, parentPanel) {
   const currentNode = state.quickStreet.currentNode;
   if (!currentNode?.panoId || !Number.isFinite(currentNode.lat) || !Number.isFinite(currentNode.lon)) return;
 
-  const nextPos = destinationPoint(Number(currentNode.lat), Number(currentNode.lon), Number(bearing), 5);
-  const streetData = await postJson("/api/paid/streetview", {
-    userConfirmedPaidCall: true,
-    lat: nextPos.lat,
-    lon: nextPos.lon,
-    heading: state.quickStreet.heading || 0,
-    fov: 90,
-    pitch: 0,
-    language: getMapLanguage(),
-    useLlm: false,
+  const decisionResp = await postJson("/api/streetview/indoor-step", {
+    currentPanoId: currentNode.panoId,
+    currentLat: Number(currentNode.lat),
+    currentLon: Number(currentNode.lon),
+    targetBearing: Number(bearing),
+    stepMeters: 5,
+    links: Array.isArray(state.quickStreet.availableLinks) ? state.quickStreet.availableLinks : [],
   });
+  const decision = decisionResp?.decision || {};
 
-  const pano = streetData?.panorama || {};
-  if (!pano.panoId) {
-    throw new Error(streetData?.text || "No nearby panorama found");
+  if (decision?.fallbackToManual) {
+    const fallbackMessage = t("indoorLowConfidenceManual");
+    announceLive(fallbackMessage);
+    updateQuickNavStatus(fallbackMessage);
+    return;
   }
 
-  const links = await fetchStreetViewLinks(pano.panoId).catch(() => []);
-  const nextNode = {
-    panoId: pano.panoId,
-    lat: Number.isFinite(Number(pano.lat)) ? Number(pano.lat) : nextPos.lat,
-    lon: Number.isFinite(Number(pano.lon)) ? Number(pano.lon) : nextPos.lon,
-    isIndoor: Boolean(streetData?.indoorLikely),
-    links,
-    providerHint: pano.providerHint || currentNode.providerHint || null,
-  };
+  let streetData = null;
+  let nextNode = null;
+  if (decision?.mode === "link" && decision?.selectedLink?.panoId) {
+    const resolved = await postJson("/api/streetview/resolve-pano", {
+      userConfirmedPaidCall: true,
+      panoId: decision.selectedLink.panoId,
+      lat: Number(currentNode.lat),
+      lon: Number(currentNode.lon),
+    });
+    const resolvedNode = resolved?.node || {};
+    streetData = await postJson("/api/paid/streetview", {
+      userConfirmedPaidCall: true,
+      panoId: resolvedNode.panoId,
+      lat: Number(resolvedNode.lat) || Number(currentNode.lat),
+      lon: Number(resolvedNode.lon) || Number(currentNode.lon),
+      heading: state.quickStreet.heading || 0,
+      fov: 90,
+      pitch: 0,
+      language: getMapLanguage(),
+      useLlm: false,
+    });
+    const links = await fetchStreetViewLinks(resolvedNode.panoId).catch(() => []);
+    nextNode = {
+      panoId: resolvedNode.panoId,
+      lat: Number(resolvedNode.lat) || Number(currentNode.lat),
+      lon: Number(resolvedNode.lon) || Number(currentNode.lon),
+      isIndoor: Boolean(resolvedNode.isIndoor),
+      links,
+      providerHint: resolvedNode.providerHint || currentNode.providerHint || null,
+    };
+  } else if (decision?.mode === "offset" && Number.isFinite(Number(decision?.target?.lat)) && Number.isFinite(Number(decision?.target?.lon))) {
+    const targetLat = Number(decision.target.lat);
+    const targetLon = Number(decision.target.lon);
+    streetData = await postJson("/api/paid/streetview", {
+      userConfirmedPaidCall: true,
+      lat: targetLat,
+      lon: targetLon,
+      heading: state.quickStreet.heading || 0,
+      fov: 90,
+      pitch: 0,
+      language: getMapLanguage(),
+      useLlm: false,
+    });
+    const pano = streetData?.panorama || {};
+    if (!pano.panoId) {
+      throw new Error(streetData?.text || t("indoorNeedManual"));
+    }
+    const links = await fetchStreetViewLinks(pano.panoId).catch(() => []);
+    nextNode = {
+      panoId: pano.panoId,
+      lat: Number.isFinite(Number(pano.lat)) ? Number(pano.lat) : targetLat,
+      lon: Number.isFinite(Number(pano.lon)) ? Number(pano.lon) : targetLon,
+      isIndoor: Boolean(streetData?.indoorLikely),
+      links,
+      providerHint: pano.providerHint || currentNode.providerHint || null,
+    };
+  } else {
+    throw new Error(t("indoorNeedManual"));
+  }
+
+  if (!streetData || !nextNode?.panoId) {
+    throw new Error(t("indoorNeedManual"));
+  }
 
   state.quickStreet.nodeHistory.push(currentNode);
   state.quickStreet.currentNode = nextNode;
-  state.quickStreet.availableLinks = links;
+  state.quickStreet.availableLinks = nextNode.links || [];
 
   parentPanel.classList.remove("error");
   parentPanel.innerHTML = "";
@@ -1426,6 +1488,16 @@ async function tryFindIndoorEntry(row, heading, panel) {
   panel.appendChild(hint);
   announceLive(switchedMessage);
   updateQuickNavStatus(switchedMessage);
+
+  if (entry?.fallbackToManual) {
+    const fallbackMessage = t("indoorLowConfidenceManual");
+    const fallbackHint = document.createElement("div");
+    fallbackHint.className = "minor";
+    fallbackHint.textContent = fallbackMessage;
+    panel.appendChild(fallbackHint);
+    announceLive(fallbackMessage);
+    updateQuickNavStatus(fallbackMessage);
+  }
 
   state.quickStreet.navigationMode = "indoor-graph";
   state.quickStreet.currentNode = entry.node;
@@ -2365,30 +2437,71 @@ function createCard(row, index, total) {
       btn.className = "link-button";
       btn.textContent = tf("indoorMoveBy", { direction: t(dir.key), meters: 5 });
       btn.addEventListener("click", async () => {
-        if (!Number.isFinite(Number(indoorNode?.lat)) || !Number.isFinite(Number(indoorNode?.lon))) return;
-        const nextPos = destinationPoint(Number(indoorNode.lat), Number(indoorNode.lon), Number(dir.bearing), 5);
-        const movedData = await postJson("/api/paid/streetview", {
-          userConfirmedPaidCall: true,
-          lat: nextPos.lat,
-          lon: nextPos.lon,
-          heading: row.bearingToNext ?? 0,
-          fov: 90,
-          pitch: 0,
-          language: getMapLanguage(),
-          useLlm: false,
+        if (!indoorNode?.panoId || !Number.isFinite(Number(indoorNode?.lat)) || !Number.isFinite(Number(indoorNode?.lon))) return;
+        const decisionResp = await postJson("/api/streetview/indoor-step", {
+          currentPanoId: indoorNode.panoId,
+          currentLat: Number(indoorNode.lat),
+          currentLon: Number(indoorNode.lon),
+          targetBearing: Number(dir.bearing),
+          stepMeters: 5,
+          links: Array.isArray(indoorNode.links) ? indoorNode.links : [],
         });
-        const movedPano = movedData?.panorama || {};
-        if (!movedPano.panoId) {
-          throw new Error(movedData?.text || "No nearby panorama found");
+        const decision = decisionResp?.decision || {};
+        if (decision?.fallbackToManual) {
+          const fallbackMessage = t("indoorLowConfidenceManual");
+          announceLive(fallbackMessage);
+          updateQuickNavStatus(fallbackMessage);
+          return;
         }
+
+        let movedData = null;
+        let movedPano = null;
+        if (decision?.mode === "link" && decision?.selectedLink?.panoId) {
+          const resolved = await postJson("/api/streetview/resolve-pano", {
+            userConfirmedPaidCall: true,
+            panoId: decision.selectedLink.panoId,
+            lat: Number(indoorNode.lat),
+            lon: Number(indoorNode.lon),
+          });
+          const resolvedNode = resolved?.node || {};
+          movedData = await postJson("/api/paid/streetview", {
+            userConfirmedPaidCall: true,
+            panoId: resolvedNode.panoId,
+            lat: Number(resolvedNode.lat) || Number(indoorNode.lat),
+            lon: Number(resolvedNode.lon) || Number(indoorNode.lon),
+            heading: row.bearingToNext ?? 0,
+            fov: 90,
+            pitch: 0,
+            language: getMapLanguage(),
+            useLlm: false,
+          });
+          movedPano = movedData?.panorama || {};
+        } else if (decision?.mode === "offset" && Number.isFinite(Number(decision?.target?.lat)) && Number.isFinite(Number(decision?.target?.lon))) {
+          movedData = await postJson("/api/paid/streetview", {
+            userConfirmedPaidCall: true,
+            lat: Number(decision.target.lat),
+            lon: Number(decision.target.lon),
+            heading: row.bearingToNext ?? 0,
+            fov: 90,
+            pitch: 0,
+            language: getMapLanguage(),
+            useLlm: false,
+          });
+          movedPano = movedData?.panorama || {};
+        }
+
+        if (!movedPano?.panoId) {
+          throw new Error(t("indoorNeedManual"));
+        }
+
         const links = await fetchStreetViewLinks(movedPano.panoId).catch(() => []);
         if (indoorNode?.panoId) {
           indoorHistory.push(indoorNode);
         }
         indoorNode = {
           panoId: movedPano.panoId,
-          lat: Number.isFinite(Number(movedPano.lat)) ? Number(movedPano.lat) : nextPos.lat,
-          lon: Number.isFinite(Number(movedPano.lon)) ? Number(movedPano.lon) : nextPos.lon,
+          lat: Number.isFinite(Number(movedPano.lat)) ? Number(movedPano.lat) : Number(indoorNode.lat),
+          lon: Number.isFinite(Number(movedPano.lon)) ? Number(movedPano.lon) : Number(indoorNode.lon),
           isIndoor: Boolean(movedData?.indoorLikely),
           links,
           providerHint: movedPano.providerHint || indoorNode?.providerHint || null,
@@ -2456,6 +2569,14 @@ function createCard(row, index, total) {
       hint.className = "minor";
       hint.textContent = tf("indoorSwitched", { meters: Math.round(Number(entry.distanceMeters) || 0) });
       indoorResult.appendChild(hint);
+      if (entry?.fallbackToManual) {
+        const fallbackHint = document.createElement("div");
+        fallbackHint.className = "minor";
+        fallbackHint.textContent = t("indoorLowConfidenceManual");
+        indoorResult.appendChild(fallbackHint);
+        announceLive(t("indoorLowConfidenceManual"));
+        updateQuickNavStatus(t("indoorLowConfidenceManual"));
+      }
       indoorResult.appendChild(renderCardIndoorControls());
     } catch (err) {
       indoorResult.classList.add("error");

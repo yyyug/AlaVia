@@ -15,9 +15,14 @@ database_id = "947b5026-bfad-4b5f-9688-dc6d0b5fad84"
 binding = "CACHE_BUCKET"
 bucket_name = "alavia-cache"
 
+[[r2_buckets]]
+binding = "TILES_BUCKET"
+bucket_name = "soundscape-tiles"
+
 [vars]
 ALLOWED_ACCESS_EMAILS = "yoofun@gmail.com"
 ALLOW_DEV_BYPASS = "false"
+# NEON_DSN is stored as a Cloudflare Workers secret (wrangler secret put NEON_DSN)
 # Optional: comma-separated invited users when protected by Cloudflare Access.
 # ALLOWED_ACCESS_EMAILS = "you@example.com,teammate@example.com"
 # Optional: expected Clerk JWT audience (when set, aud must match exactly).
@@ -31,6 +36,7 @@ routes = [
 [env.production.vars]
 ALLOWED_ACCESS_EMAILS = ""
 ALLOW_DEV_BYPASS = "false"
+# NEON_DSN is stored as a Cloudflare Workers secret (wrangler secret put NEON_DSN --env production)
 # CLERK_JWT_AUDIENCE = "https://via.inclu.si"
 
 [[env.production.d1_databases]]
@@ -41,6 +47,10 @@ database_id = "947b5026-bfad-4b5f-9688-dc6d0b5fad84"
 [[env.production.r2_buckets]]
 binding = "CACHE_BUCKET"
 bucket_name = "alavia-cache"
+
+[[env.production.r2_buckets]]
+binding = "TILES_BUCKET"
+bucket_name = "soundscape-tiles"
 
 # Add secrets with:
 # wrangler secret put GOOGLE_MAPS_API_KEY

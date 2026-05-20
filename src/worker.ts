@@ -64,6 +64,14 @@ type OsmPlaceCandidate = {
   hasFeatureTag: boolean;
 };
 
+type GeocodedAddress = {
+  lat: number;
+  lon: number;
+  streetName: string | null;
+  subThoroughfare: string | null;
+  addressLine: string | null;
+};
+
 type OsmCoverageAssessment = {
   onRoadAddressCount: number;
   onRoadNamedCount: number;
@@ -122,6 +130,22 @@ type LinkAnalysisResult = {
     feature?: string; // 楼梯、电梯、通道、剪票口等
     confidence?: number;
   };
+};
+
+type IndoorStepDecision = {
+  mode: "link" | "offset" | "manual";
+  confidence: number;
+  confidenceLevel: "high" | "medium" | "low";
+  fallbackToManual: boolean;
+  reason: string;
+  selectedLink?: {
+    panoId: string;
+    heading: number;
+    description: string;
+    label: string;
+    delta: number;
+  };
+  target?: { lat: number; lon: number };
 };
 
 const DAY = 60 * 60 * 24;
@@ -208,6 +232,9 @@ export default {
     }
     if (url.pathname === "/api/streetview/find-indoor-entry" && request.method === "POST") {
       return withErrorHandling(() => handleFindNearbyIndoorEntry(request, env, ctx));
+    }
+    if (url.pathname === "/api/streetview/indoor-step" && request.method === "POST") {
+      return withErrorHandling(() => handleIndoorStepDecision(request));
     }
     if (url.pathname === "/api/streetview/analyze-link" && request.method === "POST") {
       return withErrorHandling(() => handleAnalyzeStreetViewLink(request, env, ctx));
@@ -555,6 +582,7 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
     resolvedRoadName: roadName,
   });
 }
+
 
 async function fetchSegmentData(
   env: Env,
@@ -1506,6 +1534,19 @@ async function handleGoogleRoutePlaces(request: Request, env: Env, ctx: Executio
 
 async function handleIntersectionAddressBatch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await requireJson(request);
+  
+  // Support both request formats:
+  // 1. iOS format: { coordinates: [{lat, lon}, ...] }
+  // 2. Legacy format: { roadName, points: [{id, lat, lon}, ...], maxItems }
+  
+  const coordinates = Array.isArray(body.coordinates) ? body.coordinates : [];
+  
+  if (coordinates.length > 0) {
+    // iOS app format: simple coordinate batch geocoding
+    return handleCoordinateBatch(request, env, ctx, coordinates);
+  }
+  
+  // Legacy format: intersection-specific addressing
   const roadName = String(body.roadName || "").trim();
   const pointsRaw = Array.isArray(body.points) ? (body.points as Json[]) : [];
   const maxItems = Math.max(1, Math.min(20, Number(body.maxItems ?? 8)));
@@ -1547,6 +1588,71 @@ async function handleIntersectionAddressBatch(request: Request, env: Env, ctx: E
     count: rows.length,
     rows,
   });
+}
+
+async function handleCoordinateBatch(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  coordinates: Array<Record<string, unknown>>,
+): Promise<Response> {
+  const addresses: GeocodedAddress[] = [];
+  
+  if (!coordinates.length) {
+    return json({ addresses });
+  }
+  
+  for (const coord of coordinates) {
+    const lat = Number(coord.lat);
+    const lon = Number(coord.lon);
+    
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      continue;
+    }
+    
+    validateCoordinates(lat, lon);
+    
+    try {
+      const reverse = await fetchNominatimReverse(env, lat, lon, ctx);
+      const address = (reverse.address || {}) as Record<string, unknown>;
+      
+      let streetName: string | null = null;
+      let subThoroughfare: string | null = null;
+      
+      // Extract street name from Nominatim address
+      if (address.road) {
+        streetName = String(address.road);
+      } else if (address.street) {
+        streetName = String(address.street);
+      }
+      
+      // Extract house number
+      if (address.house_number) {
+        subThoroughfare = String(address.house_number);
+      }
+      
+      const addressLine = subThoroughfare && streetName ? `${subThoroughfare} ${streetName}` : (streetName || null);
+      
+      addresses.push({
+        lat: round6(lat),
+        lon: round6(lon),
+        streetName,
+        subThoroughfare,
+        addressLine,
+      });
+    } catch {
+      // On error, add a result with null address fields
+      addresses.push({
+        lat: round6(lat),
+        lon: round6(lon),
+        streetName: null,
+        subThoroughfare: null,
+        addressLine: null,
+      });
+    }
+  }
+  
+  return json({ addresses });
 }
 
 async function enrichIntersectionsWithAddresses(
@@ -4322,6 +4428,8 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
       });
 
       const best = top[0];
+      const second = top[1] || null;
+      const confidence = estimateIndoorEntryConfidence(best, second);
       const node = toNode(best);
       const candidates = top.map((item, index) => ({
         rank: index + 1,
@@ -4337,6 +4445,9 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
         found: true,
         checked,
         distanceMeters: best.distanceMeters,
+        confidence,
+        confidenceLevel: confidenceToLevel(confidence),
+        fallbackToManual: confidence < 0.5,
         node,
         candidates,
       } as Json;
@@ -4346,6 +4457,95 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
   );
 
   return json(cached.data);
+}
+
+async function handleIndoorStepDecision(request: Request): Promise<Response> {
+  const body = await requireJson(request);
+  const targetBearing = normalizeHeading(Number(body.targetBearing ?? 0));
+  const stepMeters = Math.max(1, Math.min(30, Number(body.stepMeters ?? 5)));
+  const currentLat = Number(body.currentLat);
+  const currentLon = Number(body.currentLon);
+  const rawLinks = Array.isArray(body.links) ? (body.links as Json[]) : [];
+
+  const links = rawLinks
+    .map((it) => ({
+      panoId: String(it.panoId || "").trim(),
+      heading: Number(it.heading),
+      description: String(it.description || "").trim(),
+      label: String(it.label || "").trim(),
+    }))
+    .filter((it) => it.panoId && Number.isFinite(it.heading));
+
+  if (links.length > 0) {
+    let best = links[0];
+    let bestDelta = Math.abs(signedBearingDelta(targetBearing, links[0].heading));
+    for (let i = 1; i < links.length; i += 1) {
+      const delta = Math.abs(signedBearingDelta(targetBearing, links[i].heading));
+      if (delta < bestDelta) {
+        best = links[i];
+        bestDelta = delta;
+      }
+    }
+
+    const confidence = bestDelta <= 25 ? 0.9 : bestDelta <= 55 ? 0.66 : 0.38;
+    const decision: IndoorStepDecision = {
+      mode: "link",
+      confidence,
+      confidenceLevel: confidenceToLevel(confidence),
+      fallbackToManual: confidence < 0.5,
+      reason: "best_link_by_heading_delta",
+      selectedLink: {
+        panoId: best.panoId,
+        heading: Math.round(normalizeHeading(best.heading)),
+        description: best.description,
+        label: best.label || best.description || "前往",
+        delta: Math.round(bestDelta),
+      },
+    };
+    return json({ ok: true, decision });
+  }
+
+  if (Number.isFinite(currentLat) && Number.isFinite(currentLon)) {
+    const target = offsetPointByMeters({ lat: currentLat, lon: currentLon }, targetBearing, stepMeters);
+    const confidence = 0.42;
+    const decision: IndoorStepDecision = {
+      mode: "offset",
+      confidence,
+      confidenceLevel: confidenceToLevel(confidence),
+      fallbackToManual: true,
+      reason: "no_links_offset_fallback",
+      target: {
+        lat: round6(target.lat),
+        lon: round6(target.lon),
+      },
+    };
+    return json({ ok: true, decision });
+  }
+
+  const decision: IndoorStepDecision = {
+    mode: "manual",
+    confidence: 0.2,
+    confidenceLevel: "low",
+    fallbackToManual: true,
+    reason: "insufficient_indoor_data",
+  };
+  return json({ ok: true, decision });
+}
+
+function confidenceToLevel(confidence: number): "high" | "medium" | "low" {
+  if (confidence >= 0.75) return "high";
+  if (confidence >= 0.5) return "medium";
+  return "low";
+}
+
+function estimateIndoorEntryConfidence(
+  best: { score: number; distanceMeters: number; indoor: boolean },
+  second: { score: number } | null,
+): number {
+  let confidence = best.indoor ? 0.82 : 0.58;
+  if (best.distanceMeters > 120) confidence -= 0.15;
+  if (second && best.score - second.score < 80) confidence -= 0.2;
+  return Math.max(0.15, Math.min(0.95, confidence));
 }
 
 // ── Analyze Link with LLM CV ────────────────────────────────────────────

@@ -17,6 +17,7 @@ const WEBHOOK_MAX_SKEW_SECONDS = 300;
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const RATE_LIMIT_DEFAULT_PER_WINDOW = 120;
 const RATE_LIMIT_PAID_PER_WINDOW = 30;
+const BUILTIN_ADMIN_EMAILS = new Set(["yoofun@gmail.com"]);
 const PRICES = {
     placesNearby: 0.005,
     streetViewStatic: 0.007,
@@ -140,17 +141,31 @@ async function handleGeocodeAutoBbox(request) {
         }
     }
     else if (normalizedCountry) {
-        const filteredItems = await fetchNominatimSearch(query, normalizedCountry);
-        if (filteredItems.length > 0) {
-            items = filteredItems;
-            resolvedCountryCode = normalizedCountry;
+        const queryVariants = buildQueryVariants(query);
+        for (const q of queryVariants) {
+            const filteredItems = await fetchNominatimSearch(q, normalizedCountry);
+            if (filteredItems.length > 0) {
+                items = filteredItems;
+                resolvedCountryCode = normalizedCountry;
+                break;
+            }
+        }
+        if (!items.length) {
+            for (const q of queryVariants) {
+                const anyItems = await fetchNominatimSearch(q, "");
+                if (anyItems.length > 0) {
+                    items = anyItems;
+                    resolvedCountryCode = normalizedCountry;
+                    break;
+                }
+            }
         }
     }
     else {
         items = await fetchNominatimSearch(query, "");
     }
     if (!Array.isArray(items) || items.length === 0) {
-        throw new Error("Geocode no result");
+        throw new Error(`Geocode no result for query "${query}" (country: ${countryCode || "any"})`);
     }
     const first = items[0] || {};
     const bb = Array.isArray(first.boundingbox) ? first.boundingbox : [];
@@ -299,9 +314,13 @@ async function handleOverpassSegment(request, env, ctx) {
     const body = await requireJson(request);
     const roadName = String(body.roadName || "").trim();
     const countryCode = String(body.countryCode || "").trim().toLowerCase();
+    const focusLatRaw = body.focusLat !== undefined ? Number(body.focusLat) : null;
+    const focusLonRaw = body.focusLon !== undefined ? Number(body.focusLon) : null;
     if (!roadName) {
         throw new Error("roadName is required");
     }
+    const focusPoint = (focusLatRaw !== null && focusLonRaw !== null && Number.isFinite(focusLatRaw) && Number.isFinite(focusLonRaw))
+        ? { lat: focusLatRaw, lon: focusLonRaw } : undefined;
     await ensureD1Schema(env);
     // Cache key uses only normalized road name — no bbox — so repeated queries for
     // the same road always hit the same cache entry regardless of Nominatim variance.
@@ -312,7 +331,7 @@ async function handleOverpassSegment(request, env, ctx) {
     };
     const cached = await getOrCreateCached(env, "osm-segment-v2", cachePayload, async () => {
         // Nominatim + Overpass are only called on a true cache miss.
-        const geo = await resolveRoadBBox(roadName, countryCode);
+        const geo = await resolveRoadBBox(roadName, countryCode, focusPoint);
         const south = geo.bbox.south;
         const west = geo.bbox.west;
         const north = geo.bbox.north;
@@ -1510,8 +1529,8 @@ async function getClerkUserMeta(userId, secretKey) {
         return { approved: false, email: "", isAdmin: false };
     const user = (await res.json());
     const approved = user.public_metadata?.approved === true;
-    const isAdmin = user.public_metadata?.role === "admin";
     const email = user.email_addresses?.[0]?.email_address || "";
+    const isAdmin = user.public_metadata?.role === "admin" || BUILTIN_ADMIN_EMAILS.has(email.toLowerCase());
     const result = { approved, email, isAdmin };
     await getEdgeCache().put(edgeReq, new Response(JSON.stringify(result), {
         headers: { "cache-control": "public, max-age=60", "content-type": "application/json" },
@@ -2087,7 +2106,7 @@ function tokenizeRoadQuery(name) {
         .filter((it) => !stopWords.has(it));
 }
 function collectWayNames(tags) {
-    const keys = ["name", "name:zh", "name:en", "official_name", "alt_name", "short_name"];
+    const keys = ["name", "name:zh", "name:ja", "name:en", "official_name", "alt_name", "short_name"];
     const out = [];
     for (const key of keys) {
         const v = String(tags[key] || "").trim();
@@ -2493,7 +2512,7 @@ async function handleAdminListUsers(request, env) {
         userId: u.id,
         email: u.email_addresses?.[0]?.email_address || "",
         approved: u.public_metadata?.approved === true,
-        isAdmin: u.public_metadata?.role === "admin",
+        isAdmin: u.public_metadata?.role === "admin" || BUILTIN_ADMIN_EMAILS.has((u.email_addresses?.[0]?.email_address || "").toLowerCase()),
         createdAt: u.created_at,
     }));
     return json({ ok: true, users: result });
@@ -2543,7 +2562,11 @@ async function handleAdminBillingSummary(request, env) {
             : [],
     });
 }
-async function resolveRoadBBox(roadName, countryCode) {
+async function resolveRoadBBox(roadName, countryCode, focusPoint) {
+    if (focusPoint && Number.isFinite(focusPoint.lat) && Number.isFinite(focusPoint.lon)) {
+        const radius = 0.012;
+        return { bbox: { south: focusPoint.lat - radius, north: focusPoint.lat + radius, west: focusPoint.lon - radius, east: focusPoint.lon + radius } };
+    }
     const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
     let items = [];
     if (normalizedCountry === "hk") {
@@ -2562,13 +2585,29 @@ async function resolveRoadBBox(roadName, countryCode) {
         }
     }
     else if (normalizedCountry) {
-        items = await fetchNominatimSearch(roadName, normalizedCountry);
+        const queryVariants = buildQueryVariants(roadName);
+        for (const q of queryVariants) {
+            const filteredItems = await fetchNominatimSearch(q, normalizedCountry);
+            if (filteredItems.length > 0) {
+                items = filteredItems;
+                break;
+            }
+        }
+        if (!items.length) {
+            for (const q of queryVariants) {
+                const anyItems = await fetchNominatimSearch(q, "");
+                if (anyItems.length > 0) {
+                    items = anyItems;
+                    break;
+                }
+            }
+        }
     }
     else {
         items = await fetchNominatimSearch(roadName, "");
     }
     if (!items.length) {
-        throw new Error("Geocode no result for road name");
+        throw new Error(`Geocode no result for road name "${roadName}" (country: ${countryCode || "any"})`);
     }
     const first = items[0] || {};
     const bb = Array.isArray(first.boundingbox) ? first.boundingbox : [];
@@ -2757,7 +2796,17 @@ function headingLabel(heading) {
     return dirs[idx];
 }
 function normalizeRoadName(name) {
-    return name.toLowerCase().replace(/\s+/g, "").trim();
+    return name.toLowerCase().replace(/\s+/g, "").trim()
+        .replace(/\u9A5B/g, "\u99C5") // 驛 → 駅
+        .replace(/\u7AD9/g, "\u99C5"); // 站 → 駅
+}
+function buildQueryVariants(query) {
+    const variants = [query];
+    const v1 = query.replace(/\u9A5B/g, "\u99C5").replace(/\u7AD9/g, "\u99C5");
+    if (v1 !== query) variants.push(v1);
+    const v2 = query.replace(/\u99C5/g, "\u9A5B");
+    if (v2 !== query && !variants.includes(v2)) variants.push(v2);
+    return variants;
 }
 function buildOverpassQuery(bbox) {
     return `
