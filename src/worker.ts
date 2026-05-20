@@ -1,5 +1,46 @@
 import { neon } from "@neondatabase/serverless";
 import { PMTiles, type RangeResponse, type Source } from "pmtiles";
+import {
+  BUILTIN_ADMIN_EMAILS,
+  CACHE_MAX_AGE_SECONDS,
+  CLERK_DOMAIN,
+  CLERK_ISSUER,
+  DAY,
+  EXTERNAL_API_TIMEOUT_MS,
+  GEOCODE_TTL_SECONDS,
+  MAX_PAID_INTERSECTIONS,
+  MAX_REQUEST_BODY_BYTES,
+  OSM_CACHE_STALE_SECONDS,
+  OSM_CACHE_TTL_SECONDS,
+  OVERPASS_MAX_ITERATIONS,
+  OVERPASS_MIN_GROWTH_RATIO,
+  OVERPASS_PLACE_TIMEOUT_MS,
+  OVERPASS_TIMEOUT_MS,
+  PRICES,
+  RATE_LIMIT_DEFAULT_PER_WINDOW,
+  RATE_LIMIT_PAID_PER_WINDOW,
+  RATE_LIMIT_WINDOW_SECONDS,
+  SOUNDSCAPE_HK_PMTILES_KEY,
+  SOUNDSCAPE_TILE_MAX_AGE_SECONDS,
+  TILE_HOT_CACHE_THRESHOLD,
+  TILE_HOT_CACHE_TTL_SECONDS,
+  TTL_365_DAYS,
+  WEBHOOK_MAX_SKEW_SECONDS,
+} from "./config/constants";
+import {
+  bearingDegrees,
+  buildQueryVariants,
+  haversineMeters,
+  headingLabel,
+  normalizeHeading,
+  normalizeRoadName,
+  nowEpoch,
+  round4,
+  round5,
+  round6,
+  sampleLineByMeters,
+  signedBearingDelta,
+} from "./lib/geo-utils";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -146,37 +187,6 @@ type IndoorStepDecision = {
     delta: number;
   };
   target?: { lat: number; lon: number };
-};
-
-const DAY = 60 * 60 * 24;
-const TTL_365_DAYS = 365 * DAY;
-const CACHE_MAX_AGE_SECONDS = DAY;
-const GEOCODE_TTL_SECONDS = 30 * DAY;
-const OSM_CACHE_TTL_SECONDS = TTL_365_DAYS;
-const OSM_CACHE_STALE_SECONDS = 30 * DAY;
-const TILE_HOT_CACHE_THRESHOLD = 3;
-const TILE_HOT_CACHE_TTL_SECONDS = 30 * DAY;
-const SOUNDSCAPE_TILE_MAX_AGE_SECONDS = 7 * DAY;
-const SOUNDSCAPE_HK_PMTILES_KEY = "pmtiles/hongkong-z16.pmtiles";
-const OVERPASS_TIMEOUT_MS = 30000;
-const OVERPASS_PLACE_TIMEOUT_MS = 15000;
-const OVERPASS_MAX_ITERATIONS = 2;
-const OVERPASS_MIN_GROWTH_RATIO = 0.05;
-const CLERK_DOMAIN = "possible-skink-4.clerk.accounts.dev";
-const CLERK_ISSUER = `https://${CLERK_DOMAIN}`;
-const EXTERNAL_API_TIMEOUT_MS = 10000;
-const MAX_PAID_INTERSECTIONS = 50;
-const MAX_REQUEST_BODY_BYTES = 100_000;
-const WEBHOOK_MAX_SKEW_SECONDS = 300;
-const RATE_LIMIT_WINDOW_SECONDS = 60;
-const RATE_LIMIT_DEFAULT_PER_WINDOW = 120;
-const RATE_LIMIT_PAID_PER_WINDOW = 30;
-const BUILTIN_ADMIN_EMAILS = new Set(["yoofun@gmail.com"]);
-
-const PRICES = {
-  placesNearby: 0.005,
-  streetViewStatic: 0.007,
-  geminiGenerate: 0.0003,
 };
 
 export default {
@@ -5229,54 +5239,6 @@ function stableStringify(value: unknown): string {
   return `{${parts.join(",")}}`;
 }
 
-// Build query variants for better CJK / multilingual geocoding.
-// Tries: original, then replaces traditional-Chinese station characters
-// with their Japanese/simplified equivalents so Nominatim can find them.
-function buildQueryVariants(query: string): string[] {
-  const variants: string[] = [query];
-  // 驛 (traditional Chinese) ↔ 駅 (Japanese)
-  const v1 = query.replace(/\u9A5B/g, "\u99C5").replace(/\u7AD9/g, "\u99C5");
-  if (v1 !== query) variants.push(v1);
-  const v2 = query.replace(/\u99C5/g, "\u9A5B");
-  if (v2 !== query && !variants.includes(v2)) variants.push(v2);
-  return variants;
-}
-
-function nowEpoch(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function round6(v: number): number {
-  return Math.round(v * 1_000_000) / 1_000_000;
-}
-
-function round5(v: number): number {
-  return Math.round(v * 100_000) / 100_000;
-}
-
-function round4(v: number): number {
-  return Math.round(v * 10_000) / 10_000;
-}
-
-function normalizeHeading(v: number): number {
-  const n = v % 360;
-  return n < 0 ? n + 360 : n;
-}
-
-function headingLabel(heading: number): string {
-  const dirs = ["北", "東北", "東", "東南", "南", "西南", "西", "西北"];
-  const idx = Math.round(normalizeHeading(heading) / 45) % 8;
-  return dirs[idx];
-}
-
-function normalizeRoadName(name: string): string {
-  return name.toLowerCase().replace(/\s+/g, "").trim()
-    // Normalize traditional Chinese / variant CJK station characters to Japanese equivalents
-    // so queries like 東京驛 match OSM names using 東京駅
-    .replace(/\u9A5B/g, "\u99C5")  // 驛 → 駅
-    .replace(/\u7AD9/g, "\u99C5"); // 站 → 駅 (Chinese station char)
-}
-
 type BBox = { south: number; west: number; north: number; east: number };
 type Way = { id: number; nodes: number[]; tags: Json };
 type ParsedOverpass = {
@@ -5579,17 +5541,6 @@ function resolveTurnCandidates(
   return { left, right };
 }
 
-function signedBearingDelta(fromBearing: number, toBearing: number): number {
-  let delta = normalizeHeading(toBearing) - normalizeHeading(fromBearing);
-  if (delta > 180) {
-    delta -= 360;
-  }
-  if (delta <= -180) {
-    delta += 360;
-  }
-  return delta;
-}
-
 function turnCandidateScore(candidate: TurnCandidate): number {
   return Math.abs(90 - Math.abs(candidate.delta));
 }
@@ -5607,49 +5558,6 @@ function dedupeIntersections<T extends { id: number }>(
     out.push(row);
   }
   return out;
-}
-
-function bearingDegrees(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
-  const phi1 = (a.lat * Math.PI) / 180;
-  const phi2 = (b.lat * Math.PI) / 180;
-  const lambda1 = (a.lon * Math.PI) / 180;
-  const lambda2 = (b.lon * Math.PI) / 180;
-  const y = Math.sin(lambda2 - lambda1) * Math.cos(phi2);
-  const x =
-    Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(lambda2 - lambda1);
-  return normalizeHeading((Math.atan2(y, x) * 180) / Math.PI);
-}
-
-function sampleLineByMeters(
-  start: { lat: number; lon: number },
-  end: { lat: number; lon: number },
-  intervalMeters: number,
-): Array<{ lat: number; lon: number }> {
-  const total = haversineMeters(start, end);
-  if (total <= 0) {
-    return [start];
-  }
-
-  const count = Math.max(1, Math.ceil(total / intervalMeters));
-  const points: Array<{ lat: number; lon: number }> = [];
-  for (let i = 0; i <= count; i += 1) {
-    const t = i / count;
-    points.push({
-      lat: start.lat + (end.lat - start.lat) * t,
-      lon: start.lon + (end.lon - start.lon) * t,
-    });
-  }
-  return points;
-}
-
-function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
-  const R = 6_371_000;
-  const p1 = (a.lat * Math.PI) / 180;
-  const p2 = (b.lat * Math.PI) / 180;
-  const dPhi = ((b.lat - a.lat) * Math.PI) / 180;
-  const dLambda = ((b.lon - a.lon) * Math.PI) / 180;
-  const x = Math.sin(dPhi / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dLambda / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
   function calculateBearing(startLat: number, startLon: number, endLat: number, endLon: number): number {

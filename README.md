@@ -77,7 +77,9 @@ npm run prefetch:hk -- --from 1 --to 50 --baseUrl https://example.com --language
 ```
 AlaVia/
 ├── src/
-│   ├── worker.ts           # Main backend: routes, API handlers, caching
+│   ├── worker.ts                # Main backend: routes, API handlers, caching
+│   ├── config/constants.ts      # Shared constants and pricing
+│   └── lib/geo-utils.ts         # Shared geo/heading/math helpers
 ├── public/
 │   ├── app.js              # Frontend: UI, i18n, user interactions
 │   ├── index.html          # HTML structure
@@ -92,9 +94,8 @@ AlaVia/
 ├── tsconfig.json           # TypeScript config
 ├── package.json            # Dependencies
 ├── .env.example            # Environment variable template
-├── CODEBASE_ANALYSIS.md    # Detailed code audit report
-├── ARCHITECTURE.md         # System design documentation
-├── API.md                  # API endpoint reference
+├── CODEBASE_ANALYSIS.md         # Detailed code audit report
+├── API.md                       # Consolidated backend reference (architecture + API + ops)
 └── README.md              # This file
 ```
 
@@ -120,7 +121,7 @@ Edit `wrangler.toml` to configure:
 
 ## 📊 Architecture Overview
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed system design.
+See [API.md](API.md) for architecture, endpoint contracts, and runbook notes.
 
 **Quick Summary:**
 - **Frontend**: Static web app (HTML/JS) with i18n support
@@ -211,8 +212,7 @@ npm run check
 Use VS Code with TypeScript extension for auto-formatting.
 
 ### See Also
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System design details
-- [API.md](API.md) - Complete API reference
+- [API.md](API.md) - System design + API reference + ops checks
 - [CODEBASE_ANALYSIS.md](CODEBASE_ANALYSIS.md) - Code audit and improvements
 - [CONTRIBUTING.md](CONTRIBUTING.md) - Development workflow
 
