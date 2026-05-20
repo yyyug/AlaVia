@@ -1,7 +1,7 @@
 ﻿const PRICES = {
   placesNearby: 0.005,
   streetViewStatic: 0.007,
-  geminiGenerate: 0.0003,
+  llmGenerate: 0.0003,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -26,13 +26,21 @@ const state = {
     lat: 0,
     lon: 0,
     heading: 0,
+    // Indoor node-based navigation
+    navigationMode: "outdoor-linear", // or "indoor-graph"
+    currentNode: null,
+    nodeHistory: [],
+    availableLinks: [],
+    indoorCandidates: [],
+    selectedCandidateIndex: -1,
+    graphCache: new Map(),
   },
 };
 
 const I18N = {
   "zh-Hant": {
     title: "AlaVia 文字地圖導覽",
-    lead: "使用方式：先在路段名稱輸入地址或道路名稱，系統會由後端自動定位並搜尋路口。",
+    lead: "使用方式：先在路段名稱輸入地址或道路名稱搜尋路口，系統會列出該道路的各個路口；你可使用沿街地點、街景詳細描述與室內導覽等功能，查看道路與車站周邊的不同資訊。",
     uiLang: "介面語言",
     querySection: "查詢路段",
     countryPref: "國家偏好",
@@ -60,11 +68,12 @@ const I18N = {
     routeOsm: "沿街地點 OSM",
     routeGoogle: "沿街地點 Google Places",
     streetDetail: "街景詳細描述",
+    indoorNav: "室內導覽",
     noDataLoaded: "尚未載入路口資料。",
     costStreet: "展開街景詳細描述：{calls} 次，預估 {usd}",
     costRouteOsm: "沿街地點 OSM：{calls} 次，使用 OSM 免費資料",
     costRouteGoogle: "沿街地點 Google Places（約 {calls} 次）：預估 {usd}",
-    costTotal: "合計預估（含 Gemini 與 Google Places）{usd}",
+    costTotal: "合計預估（含 LLM 與 Google Places）{usd}",
     advanceBtn: "往前 {distance} 公尺街景詳細描述",
     advanceSectionLabel: "前 {distance} 公尺",
     intersectionEnded: "該路口已完結",
@@ -100,10 +109,10 @@ const I18N = {
     searchFailed: "搜尋失敗：{message}",
     noLeftTurn: "此路口沒有可左轉查詢的連接街道。",
     noRightTurn: "此路口沒有可右轉查詢的連接街道。",
-    guestFreeNotice: "未登入時可使用免費 OSM 查詢；登入並通過審核後可使用付費街景/Gemini。",
+    guestFreeNotice: "一般用戶可使用免費 OSM 查詢；登入並通過審核後可使用付費街景/LLM 功能。",
     pendingApprovalNotice: "帳號 {email} 待管理員審核；目前仍可使用免費 OSM 查詢。",
-    paidLoginRequired: "請先登入後使用付費街景/Gemini 功能。",
-    paidApprovalRequired: "帳號待審核中，尚未開放付費街景/Gemini 功能。",
+    paidLoginRequired: "此功能暫未對該帳號開放。",
+    paidApprovalRequired: "帳號待審核中，尚未開放付費街景/LLM 功能。",
     sideFront: "前方附近",
     sideLeft: "左側",
     sideRight: "右側",
@@ -118,10 +127,21 @@ const I18N = {
     typeCross: "十字或多向路口",
     typeT: "T 型路口",
     typeLink: "雙向連接點",
+    indoorEnterNearby: "嘗試進入附近室內全景",
+    indoorBackPrev: "返回上一個室內點",
+    indoorNoEntry: "附近未找到可用室內街景入口",
+    indoorNoLinks: "此全景未提供可步行連結，可改選其他室內候選點。",
+    indoorSwitched: "已切換至附近室內全景（約 {meters}m）",
+    indoorSwitchedCandidate: "已切換至室內候選點 {label}（約 {meters}m）",
+    indoorDescribeEnv: "描述室內環境",
+    indoorDescribeLoading: "正在產生室內環境描述...",
+    indoorDescribeResult: "室內環境描述：{text}",
+    indoorMoveBy: "往{direction}移動 {meters}m",
+    indoorMoveDone: "已往{direction}移動約 {meters}m",
   },
   en: {
     title: "AlaVia Text Navigation",
-    lead: "Enter a road or address. The backend auto-locates and searches intersections for you.",
+    lead: "How to use: Enter an address or road name to search intersections. The system lists intersections along that road, and you can use Route Places, Street Scene Details, and Indoor Navigation to inspect different types of road and station-area information.",
     uiLang: "Interface Language",
     querySection: "Road Query",
     countryPref: "Country Preference",
@@ -149,11 +169,12 @@ const I18N = {
     routeOsm: "Route Places OSM",
     routeGoogle: "Route Places Google Places",
     streetDetail: "Street Scene Details",
+    indoorNav: "Indoor Navigation",
     noDataLoaded: "No intersection data loaded.",
     costStreet: "Street scene details: {calls} calls, estimated {usd}",
     costRouteOsm: "Route Places OSM: {calls} calls, using free OSM data",
     costRouteGoogle: "Route Places Google Places (~{calls} calls): estimated {usd}",
-    costTotal: "Estimated total (Gemini + Google Places): {usd}",
+    costTotal: "Estimated total (LLM + Google Places): {usd}",
     meters: "m",
     intersectionPrefix: "Intersection",
     unnamedRoad: "Unnamed road",
@@ -186,10 +207,10 @@ const I18N = {
     searchFailed: "Search failed: {message}",
     noLeftTurn: "No connected road available for left turn at this intersection.",
     noRightTurn: "No connected road available for right turn at this intersection.",
-    guestFreeNotice: "You can use free OSM queries when signed out; paid Street View/Gemini features are available after sign-in and approval.",
+    guestFreeNotice: "You can use free OSM queries when signed out; paid Street View/LLM features are available after sign-in and approval.",
     pendingApprovalNotice: "Account {email} is pending admin approval. Free OSM queries are still available.",
-    paidLoginRequired: "Sign in first to use paid Street View/Gemini features.",
-    paidApprovalRequired: "Your account is pending approval. Paid Street View/Gemini features are not available yet.",
+    paidLoginRequired: "Sign in first to use paid Street View/LLM features.",
+    paidApprovalRequired: "Your account is pending approval. Paid Street View/LLM features are not available yet.",
     advanceBtn: "Advance {distance}m Street Scene Details",
     advanceSectionLabel: "{distance}m forward",
     intersectionEnded: "End of segment",
@@ -207,10 +228,21 @@ const I18N = {
     typeCross: "Cross or multi-way intersection",
     typeT: "T intersection",
     typeLink: "Two-way connection",
+    indoorEnterNearby: "Try Nearby Indoor Panorama",
+    indoorBackPrev: "Back To Previous Indoor Spot",
+    indoorNoEntry: "No nearby indoor Street View entry found",
+    indoorNoLinks: "No walkable panorama links are available here. Try another indoor candidate.",
+    indoorSwitched: "Switched to a nearby indoor panorama (~{meters}m)",
+    indoorSwitchedCandidate: "Switched to indoor candidate {label} (~{meters}m)",
+    indoorDescribeEnv: "Describe Indoor Surroundings",
+    indoorDescribeLoading: "Generating indoor surroundings description...",
+    indoorDescribeResult: "Indoor surroundings: {text}",
+    indoorMoveBy: "Move {meters}m to {direction}",
+    indoorMoveDone: "Moved about {meters}m to {direction}",
   },
   ja: {
     title: "AlaVia テキスト地図ナビ",
-    lead: "道路名や住所を入力すると、バックエンドが自動で位置特定して交差点を検索します。",
+    lead: "使い方：住所または道路名を入力して交差点を検索します。対象道路の交差点一覧が表示され、沿道地点・街景の詳細説明・室内ナビを使って、道路や駅周辺の情報を多面的に確認できます。",
     uiLang: "表示言語",
     querySection: "道路検索",
     countryPref: "国選択",
@@ -238,11 +270,12 @@ const I18N = {
     routeOsm: "沿道地点 OSM",
     routeGoogle: "沿道地点 Google Places",
     streetDetail: "街景の詳細説明",
+    indoorNav: "室内ナビ",
     noDataLoaded: "交差点データは未読み込みです。",
     costStreet: "街景の詳細説明: {calls} 回、推定 {usd}",
     costRouteOsm: "沿道地点 OSM: {calls} 回（OSM 無料データ）",
     costRouteGoogle: "沿道地点 Google Places（約 {calls} 回）: 推定 {usd}",
-    costTotal: "推定合計（Gemini + Google Places）: {usd}",
+    costTotal: "推定合計（LLM + Google Places）: {usd}",
     meters: "m",
     intersectionPrefix: "交差点",
     unnamedRoad: "無名道路",
@@ -275,10 +308,10 @@ const I18N = {
     searchFailed: "検索失敗: {message}",
     noLeftTurn: "この交差点で左折可能な接続道路はありません。",
     noRightTurn: "この交差点で右折可能な接続道路はありません。",
-    guestFreeNotice: "未ログインでも無料の OSM 照会は利用できます。ログインして承認されると有料の Street View/Gemini 機能が使えます。",
+    guestFreeNotice: "未ログインでも無料の OSM 照会は利用できます。ログインして承認されると有料の Street View/LLM 機能が使えます。",
     pendingApprovalNotice: "アカウント {email} は管理者承認待ちです。無料の OSM 照会は引き続き利用できます。",
-    paidLoginRequired: "有料の Street View/Gemini 機能を使うにはログインしてください。",
-    paidApprovalRequired: "アカウント承認待ちのため、有料の Street View/Gemini 機能はまだ利用できません。",
+    paidLoginRequired: "有料の Street View/LLM 機能を使うにはログインしてください。",
+    paidApprovalRequired: "アカウント承認待ちのため、有料の Street View/LLM 機能はまだ利用できません。",
     advanceBtn: "前方 {distance}m の街景詳細説明",
     advanceSectionLabel: "前方 {distance}m",
     intersectionEnded: "この区間は終了しました",
@@ -296,10 +329,21 @@ const I18N = {
     typeCross: "十字・多方向交差点",
     typeT: "T字交差点",
     typeLink: "双方向接続点",
+    indoorEnterNearby: "近くの屋内パノラマへ移動",
+    indoorBackPrev: "前の屋内ポイントに戻る",
+    indoorNoEntry: "近くで利用可能な屋内Street View入口が見つかりません",
+    indoorNoLinks: "このパノラマには徒歩リンクがありません。別の屋内候補を試してください。",
+    indoorSwitched: "近くの屋内パノラマへ切替（約 {meters}m）",
+    indoorSwitchedCandidate: "屋内候補 {label} に切替（約 {meters}m）",
+    indoorDescribeEnv: "室内環境を説明",
+    indoorDescribeLoading: "室内環境の説明を生成中...",
+    indoorDescribeResult: "室内環境: {text}",
+    indoorMoveBy: "{direction}へ {meters}m 移動",
+    indoorMoveDone: "{direction}へ約 {meters}m 移動しました",
   },
   ko: {
     title: "AlaVia 텍스트 지도 내비",
-    lead: "도로명 또는 주소를 입력하면 백엔드가 자동으로 위치를 찾고 교차로를 검색합니다.",
+    lead: "사용 방법: 주소 또는 도로명을 입력해 교차로를 검색합니다. 해당 도로의 교차로 목록이 표시되며, 연선 장소·거리 장면 상세·실내 내비 기능으로 도로와 역 주변 정보를 다양한 관점에서 확인할 수 있습니다.",
     uiLang: "인터페이스 언어",
     querySection: "도로 검색",
     countryPref: "국가 선택",
@@ -327,11 +371,12 @@ const I18N = {
     routeOsm: "연선 장소 OSM",
     routeGoogle: "연선 장소 Google Places",
     streetDetail: "거리 장면 상세",
+    indoorNav: "실내 내비",
     noDataLoaded: "교차로 데이터가 아직 없습니다.",
     costStreet: "거리 장면 상세: {calls}회, 예상 {usd}",
     costRouteOsm: "연선 장소 OSM: {calls}회, OSM 무료 데이터 사용",
     costRouteGoogle: "연선 장소 Google Places(약 {calls}회): 예상 {usd}",
-    costTotal: "총 예상(Gemini + Google Places): {usd}",
+    costTotal: "총 예상(LLM + Google Places): {usd}",
     meters: "m",
     intersectionPrefix: "교차로",
     unnamedRoad: "이름 없는 도로",
@@ -364,10 +409,10 @@ const I18N = {
     searchFailed: "검색 실패: {message}",
     noLeftTurn: "이 교차로에서 좌회전 가능한 연결 도로가 없습니다.",
     noRightTurn: "이 교차로에서 우회전 가능한 연결 도로가 없습니다.",
-    guestFreeNotice: "로그아웃 상태에서도 무료 OSM 조회는 사용할 수 있으며, 로그인 후 승인되면 유료 Street View/Gemini 기능을 사용할 수 있습니다.",
+    guestFreeNotice: "로그아웃 상태에서도 무료 OSM 조회는 사용할 수 있으며, 로그인 후 승인되면 유료 Street View/LLM 기능을 사용할 수 있습니다.",
     pendingApprovalNotice: "계정 {email} 은(는) 관리자 승인 대기 중입니다. 무료 OSM 조회는 계속 사용할 수 있습니다.",
-    paidLoginRequired: "유료 Street View/Gemini 기능을 사용하려면 먼저 로그인하세요.",
-    paidApprovalRequired: "계정 승인 대기 중이므로 유료 Street View/Gemini 기능은 아직 사용할 수 없습니다.",
+    paidLoginRequired: "유료 Street View/LLM 기능을 사용하려면 먼저 로그인하세요.",
+    paidApprovalRequired: "계정 승인 대기 중이므로 유료 Street View/LLM 기능은 아직 사용할 수 없습니다.",
     advanceBtn: "{distance}m 전방 거리 장면 상세",
     advanceSectionLabel: "전방 {distance}m",
     intersectionEnded: "이 구간이 종료되었습니다",
@@ -385,6 +430,17 @@ const I18N = {
     typeCross: "십자/다방향 교차로",
     typeT: "T자 교차로",
     typeLink: "양방향 연결점",
+    indoorEnterNearby: "근처 실내 파노라마로 이동",
+    indoorBackPrev: "이전 실내 지점으로 돌아가기",
+    indoorNoEntry: "근처에서 사용 가능한 실내 Street View 진입점을 찾지 못했습니다",
+    indoorNoLinks: "이 파노라마에는 도보 링크가 없습니다. 다른 실내 후보를 시도하세요.",
+    indoorSwitched: "근처 실내 파노라마로 전환됨 (약 {meters}m)",
+    indoorSwitchedCandidate: "실내 후보 {label}(으)로 전환됨 (약 {meters}m)",
+    indoorDescribeEnv: "실내 환경 설명",
+    indoorDescribeLoading: "실내 환경 설명 생성 중...",
+    indoorDescribeResult: "실내 환경: {text}",
+    indoorMoveBy: "{direction} 방향으로 {meters}m 이동",
+    indoorMoveDone: "{direction} 방향으로 약 {meters}m 이동했습니다",
   },
 };
 
@@ -396,10 +452,59 @@ function t(key) {
   const dict = I18N[state.uiLang] || I18N["zh-Hant"];
   return dict[key] || I18N.en[key] || I18N["zh-Hant"][key] || key;
 }
+function bearingToCompass(bearing) {
+  bearing = ((bearing % 360) + 360) % 360;
+  if (bearing >= 337.5 || bearing < 22.5) return "北";
+  if (bearing >= 22.5 && bearing < 67.5) return "東北";
+  if (bearing >= 67.5 && bearing < 112.5) return "東";
+  if (bearing >= 112.5 && bearing < 157.5) return "東南";
+  if (bearing >= 157.5 && bearing < 202.5) return "南";
+  if (bearing >= 202.5 && bearing < 247.5) return "西南";
+  if (bearing >= 247.5 && bearing < 292.5) return "西";
+  if (bearing >= 292.5 && bearing < 337.5) return "西北";
+  return "?";
+}
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dPhi = ((lat2 - lat1) * Math.PI) / 180;
+  const dLambda = ((lon2 - lon1) * Math.PI) / 180;
+  const x = Math.sin(dPhi / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dLambda / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
 
 function tf(key, vars = {}) {
   const template = t(key);
   return String(template).replace(/\{(\w+)\}/g, (_, name) => String(vars[name] ?? ""));
+}
+
+function announceLive(text) {
+  const region = $("srAnnouncements");
+  if (!region) return;
+  region.textContent = "";
+  setTimeout(() => {
+    region.textContent = String(text || "");
+  }, 20);
+}
+
+function isDisabledLlmDescription(text) {
+  const normalized = String(text || "").trim();
+  return normalized.includes("未啟用 LLM 描述");
+}
+
+function sanitizeStreetSummaryText(text) {
+  const lines = String(text || "").split("\n");
+  const kept = lines.filter((line) => !isDisabledLlmDescription(line));
+  return kept.join("\n").trim();
+}
+
+function directionLabelFromBearing(bearing) {
+  const normalized = ((Number(bearing) % 360) + 360) % 360;
+  const idx = Math.round(normalized / 45) % 8;
+  const keys = ["dirN", "dirNE", "dirE", "dirSE", "dirS", "dirSW", "dirW", "dirNW"];
+  return t(keys[idx]);
 }
 
 function getMapLanguage() {
@@ -430,6 +535,10 @@ function setStaticTexts() {
   $("navRightBtn").textContent = t("right");
   refreshQuickStreetButtonState();
   refreshQuickStreetAdvanceButton();
+  refreshQuickIndoorButtonState();
+  if ($("quickIndoorBtn")) {
+    $("quickIndoorBtn").textContent = t("indoorNav");
+  }
   $("intersectionSectionTitle").textContent = t("intersections");
 }
 
@@ -464,12 +573,22 @@ function initCountryOptions() {
 }
 
 function getSampleInterval() {
-  return Math.max(10, Number($("sampleInterval").value || 30));
+  return Math.max(10, Number($("sampleInterval").value || 10));
 }
 
 function getCountryCode() {
   const v = String($("countryCode")?.value || "TW").trim().toUpperCase();
   return /^[A-Z]{2}$/.test(v) ? v : "TW";
+}
+
+function syncCountryPreferenceByUiLang() {
+  const country = $("countryCode");
+  if (!country) return;
+  if (state.uiLang === "ja") {
+    country.value = "JP";
+  } else if (state.uiLang === "ko") {
+    country.value = "KR";
+  }
 }
 
 function formatUsd(v) {
@@ -479,7 +598,7 @@ function formatUsd(v) {
 function estimateCosts() {
   const count = state.intersections.length;
   const streetCalls = count * 2;
-  const streetUsd = count * 2 * (PRICES.streetViewStatic + PRICES.geminiGenerate);
+  const streetUsd = count * 2 * (PRICES.streetViewStatic + PRICES.llmGenerate);
 
   const interval = getSampleInterval();
   let routeSamples = 0;
@@ -539,14 +658,82 @@ async function postJson(path, body) {
   return json;
 }
 
-function setBusy(btn, busy) {
-  btn.disabled = busy;
-  if (busy) {
-    btn.dataset.label = btn.textContent;
-    btn.textContent = t("loading");
-  } else {
-    btn.textContent = btn.dataset.label || btn.textContent;
+// Google Maps JS API initialization for Street View Links
+let googleMapsApiKey = null;
+let streetViewService = null;
+
+async function initGoogleMapsApi() {
+  if (streetViewService) return;
+  
+  try {
+    // Fetch API key from backend
+    const keyRes = await postJson("/api/config/maps-key", {});
+    if (keyRes.ok && keyRes.apiKey) {
+      googleMapsApiKey = keyRes.apiKey;
+      
+      // Load Google Maps API
+      const script = document.getElementById("google-maps-api");
+      script.src = `https://maps.googleapis.com/maps/api/js?key=${googleMapsApiKey}&libraries=streetView`;
+      
+      await new Promise((resolve, reject) => {
+        script.addEventListener("load", resolve);
+        script.addEventListener("error", reject);
+      });
+      
+      // Initialize Street View Service
+      streetViewService = new google.maps.StreetViewService();
+    }
+  } catch (err) {
+    console.error("Failed to initialize Google Maps API:", err);
   }
+}
+
+async function fetchStreetViewLinks(panoId) {
+  if (!streetViewService) {
+    await initGoogleMapsApi();
+  }
+  
+  if (!streetViewService) {
+    console.warn("Street View Service not available");
+    return [];
+  }
+  
+  return new Promise((resolve) => {
+    streetViewService.getPanorama({ pano: panoId }, (result, status) => {
+      if (status !== google.maps.StreetViewStatus.OK) {
+        console.warn("Failed to fetch Street View panorama:", status);
+        resolve([]);
+        return;
+      }
+      
+      if (!result || !result.links) {
+        resolve([]);
+        return;
+      }
+      
+      // Transform links to our format with direction labels
+      const links = result.links.map(link => {
+        const heading = link.heading || 0;
+        const dir = bearingToRelativeDir(heading);
+        const desc = link.description || "前往";
+        return {
+          panoId: link.pano,
+          heading: heading,
+          description: desc,
+          label: `${dir}${desc ? ` ${desc}` : ""}`
+        };
+      });
+      
+      resolve(links);
+    });
+  });
+}
+
+function bearingToRelativeDir(bearing) {
+  const normalized = ((bearing % 360) + 360) % 360;
+  const dirs = ["前方", "右前方", "右方", "右後方", "後方", "左後方", "左方", "左前方"];
+  const idx = Math.round(normalized / 45) % 8;
+  return dirs[idx];
 }
 
 function toLocalMetersSimple(origin, point) {
@@ -572,10 +759,26 @@ function describeRelativeSide(start, end, point) {
   return sideMeters > 0 ? t("sideLeft") : t("sideRight");
 }
 
+function buildPrimaryIntersectionLabel(addressLabel, roadLabel) {
+  const normalizedAddress = String(addressLabel || "").trim();
+  const normalizedRoad = String(roadLabel || "").trim();
+  if (!normalizedAddress) return normalizedRoad || t("unknownRoad");
+  if (!normalizedRoad || normalizedAddress.includes(normalizedRoad)) return normalizedAddress;
+
+  const streetPrefix = normalizedAddress.replace(/\s*\d+.*$/, "").trim();
+  if (streetPrefix && normalizedRoad.startsWith(streetPrefix)) {
+    const suffix = normalizedRoad.slice(streetPrefix.length).trim();
+    return suffix ? `${normalizedAddress} ${suffix}` : normalizedAddress;
+  }
+
+  return `${normalizedAddress} ${normalizedRoad}`;
+}
+
 function buildIntersectionHeading(row, index) {
   const nameParts = String(row.name || "").split("×").map((part) => part.trim()).filter(Boolean);
   const crossStreet = row.crossStreets?.[0] || nameParts[1] || t("unnamedRoad");
-  const primary = row.addressLabel || nameParts[0] || state.roadName || t("unknownRoad");
+  const primaryRoad = nameParts[0] || state.roadName || t("unknownRoad");
+  const primary = buildPrimaryIntersectionLabel(row.addressLabel, primaryRoad);
   return `${t("intersectionPrefix")} ${index + 1}: ${primary} × ${crossStreet}`;
 }
 
@@ -692,9 +895,18 @@ function refreshQuickStreetButtonState() {
   const btn = $("quickStreetBtn");
   if (!btn) return;
 
-  const streetUsd = 2 * (PRICES.streetViewStatic + PRICES.geminiGenerate);
+  const streetUsd = 2 * (PRICES.streetViewStatic + PRICES.llmGenerate);
   btn.textContent = `${t("streetDetail")}（${formatUsd(streetUsd)}）`;
 
+  const blocked = getPaidBlockedMessage();
+  btn.disabled = Boolean(blocked) || !state.intersections.length;
+  btn.title = blocked || "";
+}
+
+function refreshQuickIndoorButtonState() {
+  const btn = $("quickIndoorBtn");
+  if (!btn) return;
+  btn.textContent = t("indoorNav");
   const blocked = getPaidBlockedMessage();
   btn.disabled = Boolean(blocked) || !state.intersections.length;
   btn.title = blocked || "";
@@ -841,13 +1053,412 @@ function resetQuickStreetPanel() {
   state.quickStreet.lat = 0;
   state.quickStreet.lon = 0;
   state.quickStreet.heading = 0;
+  state.quickStreet.navigationMode = "outdoor-linear";
+  state.quickStreet.currentNode = null;
+  state.quickStreet.nodeHistory = [];
+  state.quickStreet.availableLinks = [];
+  state.quickStreet.indoorCandidates = [];
+  state.quickStreet.selectedCandidateIndex = -1;
 
   const panel = $("quickNavStreet");
   if (panel) {
     panel.classList.remove("error");
     panel.textContent = "";
   }
+  const indoorPanel = $("quickNavIndoor");
+  if (indoorPanel) {
+    indoorPanel.classList.remove("error");
+    indoorPanel.textContent = "";
+  }
   refreshQuickStreetAdvanceButton();
+  refreshQuickIndoorButtonState();
+}
+
+function renderIndoorNavigation(node, parentPanel) {
+  const container = document.createElement("div");
+  container.className = "indoor-nav-section";
+  
+  const header = document.createElement("h4");
+  header.textContent = `${t("indoorNav")} - ${node.providerHint || "Street View"}`;
+  container.appendChild(header);
+
+  if (state.quickStreet.nodeHistory.length > 0) {
+    const backBtn = document.createElement("button");
+    backBtn.type = "button";
+    backBtn.className = "advance-btn";
+    backBtn.textContent = t("indoorBackPrev");
+    backBtn.addEventListener("click", async () => {
+      await goBackIndoorNode(parentPanel);
+    });
+    container.appendChild(backBtn);
+  }
+
+  if (Array.isArray(state.quickStreet.indoorCandidates) && state.quickStreet.indoorCandidates.length > 1) {
+    container.appendChild(renderIndoorCandidateButtons(parentPanel));
+  }
+
+  const moveWrap = document.createElement("div");
+  moveWrap.className = "pano-links";
+  const stepDirections = [
+    { bearing: 0, key: "dirN" },
+    { bearing: 45, key: "dirNE" },
+    { bearing: 90, key: "dirE" },
+    { bearing: 135, key: "dirSE" },
+    { bearing: 180, key: "dirS" },
+    { bearing: 225, key: "dirSW" },
+    { bearing: 270, key: "dirW" },
+    { bearing: 315, key: "dirNW" },
+  ];
+  for (const dir of stepDirections) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "link-button";
+    btn.textContent = tf("indoorMoveBy", { direction: t(dir.key), meters: 5 });
+    btn.addEventListener("click", async () => {
+      await moveQuickIndoorByBearing(dir.bearing, parentPanel);
+    });
+    moveWrap.appendChild(btn);
+  }
+  container.appendChild(moveWrap);
+
+  if (node.links && node.links.length > 0) {
+    const linksDiv = document.createElement("div");
+    linksDiv.className = "pano-links";
+    
+    for (const link of node.links) {
+      const btn = document.createElement("button");
+      btn.className = "link-button";
+      // Display formatted label with direction (e.g., "右前方樓梯")
+      btn.textContent = link.label || `${link.description || "前往"}`;
+      btn.title = `${link.heading}°`;
+      btn.onclick = async () => {
+        await navigateToLink(link, parentPanel);
+      };
+      linksDiv.appendChild(btn);
+    }
+    container.appendChild(linksDiv);
+  }
+
+  // Optional CV analyze button
+  const analyzeBtn = document.createElement("button");
+  analyzeBtn.className = "analyze-btn";
+  analyzeBtn.textContent = "詳細分析 (可選，費用 $0.0003)";
+  analyzeBtn.onclick = async () => {
+    await analyzeWithLlm(node, parentPanel);
+  };
+  container.appendChild(analyzeBtn);
+
+  if (!node.links || node.links.length === 0) {
+    const noLinkHint = document.createElement("div");
+    noLinkHint.className = "minor";
+    noLinkHint.textContent = t("indoorNoLinks");
+    container.appendChild(noLinkHint);
+  }
+
+  return container;
+}
+
+function renderIndoorCandidateButtons(parentPanel) {
+  const wrap = document.createElement("div");
+  wrap.className = "pano-links";
+  for (let i = 0; i < state.quickStreet.indoorCandidates.length; i += 1) {
+    const c = state.quickStreet.indoorCandidates[i];
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "link-button";
+    const mark = i === state.quickStreet.selectedCandidateIndex ? "*" : "";
+    const currentNode = state.quickStreet.currentNode;
+    let relativeDistance = Math.round(Number(c.distanceMeters) || 0);
+    if (currentNode?.lat && currentNode?.lon && c.node?.lat && c.node?.lon) {
+      relativeDistance = Math.round(haversineMeters(currentNode.lat, currentNode.lon, c.node.lat, c.node.lon));
+    }
+    const direction = c.bearing !== undefined ? bearingToCompass(c.bearing) : "?";
+    btn.textContent = `${mark}入口 ${String.fromCharCode(65 + i)} (${relativeDistance}m) [${direction}]`;
+    btn.addEventListener("click", async () => {
+      await switchIndoorCandidate(i, parentPanel);
+    });
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
+async function goBackIndoorNode(parentPanel) {
+  if (!state.quickStreet.nodeHistory.length) return;
+  const prevNode = state.quickStreet.nodeHistory.pop();
+  if (!prevNode || !prevNode.panoId) return;
+
+  const streetData = await postJson("/api/paid/streetview", {
+    userConfirmedPaidCall: true,
+    panoId: prevNode.panoId,
+    lat: Number(prevNode.lat) || state.quickStreet.lat,
+    lon: Number(prevNode.lon) || state.quickStreet.lon,
+    heading: state.quickStreet.heading,
+    fov: 90,
+    pitch: 0,
+    language: getMapLanguage(),
+    useLlm: false,
+  });
+
+  state.quickStreet.currentNode = prevNode;
+  state.quickStreet.availableLinks = prevNode.links || [];
+
+  parentPanel.classList.remove("error");
+  parentPanel.innerHTML = "";
+  parentPanel.appendChild(createStreetResultSection(streetData));
+  parentPanel.appendChild(renderIndoorNavigation(prevNode, parentPanel));
+}
+
+async function switchIndoorCandidate(index, parentPanel) {
+  const candidate = state.quickStreet.indoorCandidates[index];
+  if (!candidate || !candidate.node || !candidate.node.panoId) return;
+
+  const currentNode = state.quickStreet.currentNode;
+  if (currentNode?.panoId && currentNode.panoId !== candidate.node.panoId) {
+    state.quickStreet.nodeHistory.push(currentNode);
+  }
+
+  state.quickStreet.selectedCandidateIndex = index;
+  const streetData = await postJson("/api/paid/streetview", {
+    userConfirmedPaidCall: true,
+    panoId: candidate.node.panoId,
+    lat: Number(candidate.node.lat) || state.quickStreet.lat,
+    lon: Number(candidate.node.lon) || state.quickStreet.lon,
+    heading: state.quickStreet.heading,
+    fov: 90,
+    pitch: 0,
+    language: getMapLanguage(),
+    useLlm: false,
+  });
+
+  state.quickStreet.currentNode = candidate.node;
+  state.quickStreet.availableLinks = candidate.node.links || [];
+
+  parentPanel.classList.remove("error");
+  parentPanel.innerHTML = "";
+  parentPanel.appendChild(createStreetResultSection(streetData));
+
+  const hint = document.createElement("div");
+  hint.className = "minor";
+  const switchedMessage = tf("indoorSwitchedCandidate", {
+    label: String.fromCharCode(65 + index),
+    meters: Math.round(Number(candidate.distanceMeters) || 0),
+  });
+  hint.textContent = switchedMessage;
+  parentPanel.appendChild(hint);
+  announceLive(switchedMessage);
+  updateQuickNavStatus(switchedMessage);
+  parentPanel.appendChild(renderIndoorNavigation(candidate.node, parentPanel));
+}
+
+async function moveQuickIndoorByBearing(bearing, parentPanel) {
+  const currentNode = state.quickStreet.currentNode;
+  if (!currentNode?.panoId || !Number.isFinite(currentNode.lat) || !Number.isFinite(currentNode.lon)) return;
+
+  const nextPos = destinationPoint(Number(currentNode.lat), Number(currentNode.lon), Number(bearing), 5);
+  const streetData = await postJson("/api/paid/streetview", {
+    userConfirmedPaidCall: true,
+    lat: nextPos.lat,
+    lon: nextPos.lon,
+    heading: state.quickStreet.heading || 0,
+    fov: 90,
+    pitch: 0,
+    language: getMapLanguage(),
+    useLlm: false,
+  });
+
+  const pano = streetData?.panorama || {};
+  if (!pano.panoId) {
+    throw new Error(streetData?.text || "No nearby panorama found");
+  }
+
+  const links = await fetchStreetViewLinks(pano.panoId).catch(() => []);
+  const nextNode = {
+    panoId: pano.panoId,
+    lat: Number.isFinite(Number(pano.lat)) ? Number(pano.lat) : nextPos.lat,
+    lon: Number.isFinite(Number(pano.lon)) ? Number(pano.lon) : nextPos.lon,
+    isIndoor: Boolean(streetData?.indoorLikely),
+    links,
+    providerHint: pano.providerHint || currentNode.providerHint || null,
+  };
+
+  state.quickStreet.nodeHistory.push(currentNode);
+  state.quickStreet.currentNode = nextNode;
+  state.quickStreet.availableLinks = links;
+
+  parentPanel.classList.remove("error");
+  parentPanel.innerHTML = "";
+  parentPanel.appendChild(createStreetResultSection(streetData));
+  parentPanel.appendChild(renderIndoorNavigation(nextNode, parentPanel));
+
+  const message = tf("indoorMoveDone", { direction: directionLabelFromBearing(bearing), meters: 5 });
+  announceLive(message);
+  updateQuickNavStatus(message);
+}
+
+async function navigateToLink(link, parentPanel) {
+  try {
+    parentPanel.textContent = "載入中...";
+    
+    const nextNode = await postJson("/api/streetview/resolve-pano", {
+      userConfirmedPaidCall: true,
+      panoId: link.panoId,
+    });
+
+    if (!nextNode.ok) {
+      parentPanel.classList.add("error");
+      parentPanel.textContent = `錯誤: ${nextNode.error}`;
+      return;
+    }
+
+    // Fetch links for the new panorama
+    try {
+      const links = await fetchStreetViewLinks(nextNode.node.panoId);
+      if (links.length > 0) {
+        nextNode.node.links = links;
+      }
+    } catch (err) {
+      console.warn("Failed to fetch links for next node:", err);
+    }
+
+    if (state.quickStreet.currentNode?.panoId) {
+      state.quickStreet.nodeHistory.push(state.quickStreet.currentNode);
+    }
+    state.quickStreet.currentNode = nextNode.node;
+    state.quickStreet.availableLinks = nextNode.node.links || [];
+    
+    // Re-render
+    parentPanel.classList.remove("error");
+    parentPanel.innerHTML = "";
+    
+    const streetSection = createStreetResultSection({
+      ok: true,
+      provider: "streetview",
+      hasStreetView: true,
+      indoorLikely: nextNode.node.isIndoor,
+      panorama: {
+        panoId: nextNode.node.panoId,
+        description: "室內街景",
+        links: nextNode.node.links,
+      },
+    });
+    parentPanel.appendChild(streetSection);
+    
+    if (nextNode.node.isIndoor || (nextNode.node.links && nextNode.node.links.length > 0)) {
+      parentPanel.appendChild(renderIndoorNavigation(nextNode.node, parentPanel));
+    }
+  } catch (err) {
+    parentPanel.classList.add("error");
+    parentPanel.textContent = `${t("errorPrefix")}${err.message}`;
+  }
+}
+
+async function analyzeWithLlm(node, parentPanel) {
+  try {
+    if (!node.links || node.links.length === 0) {
+      alert("此節點無可分析的方向");
+      return;
+    }
+
+    const link = node.links[0];
+    const result = await postJson("/api/streetview/analyze-link", {
+      userConfirmedPaidCall: true,
+      panoId: node.panoId,
+      heading: link.heading,
+      description: link.description,
+      fov: 90,
+      pitch: 0,
+      language: getMapLanguage(),
+    });
+
+    if (!result.ok) {
+      alert(`分析失敗: ${result.error}`);
+      return;
+    }
+
+    alert(`分析結果: ${result.label}\n描述: ${result.cvAnalysis}`);
+  } catch (err) {
+    alert(`${t("errorPrefix")}${err.message}`);
+  }
+}
+
+async function tryFindIndoorEntry(row, heading, panel) {
+  panel.classList.remove("error");
+  panel.textContent = t("queryLoading");
+
+  const key = `quick-indoor-entry:${row.id}:${state.uiLang}`;
+  let entry = state.queryCache.get(key);
+  if (!entry) {
+    entry = await postJson("/api/streetview/find-indoor-entry", {
+      lat: row.lat,
+      lon: row.lon,
+      radiusMeters: 220,
+    });
+    state.queryCache.set(key, entry);
+  }
+
+  if (!entry.ok || !entry.found || !entry.node?.panoId) {
+    panel.classList.add("error");
+    panel.textContent = entry.error || t("indoorNoEntry");
+    return;
+  }
+
+  const candidates = Array.isArray(entry.candidates) ? entry.candidates : [];
+
+  const streetData = await postJson("/api/paid/streetview", {
+    userConfirmedPaidCall: true,
+    panoId: entry.node.panoId,
+    lat: Number(entry.node.lat) || row.lat,
+    lon: Number(entry.node.lon) || row.lon,
+    heading,
+    fov: 90,
+    pitch: 0,
+    language: getMapLanguage(),
+    useLlm: false,
+  });
+
+  panel.innerHTML = "";
+  panel.appendChild(createStreetResultSection(streetData));
+
+  const hint = document.createElement("div");
+  hint.className = "minor";
+  const switchedMessage = tf("indoorSwitched", { meters: Math.round(Number(entry.distanceMeters) || 0) });
+  hint.textContent = switchedMessage;
+  panel.appendChild(hint);
+  announceLive(switchedMessage);
+  updateQuickNavStatus(switchedMessage);
+
+  state.quickStreet.navigationMode = "indoor-graph";
+  state.quickStreet.currentNode = entry.node;
+  state.quickStreet.availableLinks = entry.node.links || [];
+  state.quickStreet.nodeHistory = [];
+  state.quickStreet.indoorCandidates = candidates;
+  state.quickStreet.selectedCandidateIndex = candidates.findIndex((c) => c?.node?.panoId === entry.node.panoId);
+
+  const advBtn = $("quickStreetAdvanceBtn");
+  if (advBtn) advBtn.style.display = "none";
+
+  panel.appendChild(renderIndoorNavigation(entry.node, panel));
+}
+
+async function runQuickIndoorNavigation() {
+  const row = state.intersections[state.focusedIndex];
+  const panel = $("quickNavIndoor");
+  if (!row || !panel) return;
+
+  const blocked = getPaidBlockedMessage();
+  if (blocked) {
+    panel.classList.add("error");
+    panel.textContent = blocked;
+    return;
+  }
+
+  const heading = row.bearingToNext ?? 0;
+  try {
+    await tryFindIndoorEntry(row, heading, panel);
+  } catch (err) {
+    panel.classList.add("error");
+    panel.textContent = `${t("errorPrefix")}${err.message}`;
+  }
 }
 
 async function runQuickStreetDetail() {
@@ -883,7 +1494,53 @@ async function runQuickStreetDetail() {
       state.queryCache.set(key, data);
     }
 
-    panel.textContent = extractStreetBlocks(data.text);
+    // Fetch Street View Links if available
+    if (data.ok && data.panorama?.panoId && data.indoorLikely) {
+      try {
+        const links = await fetchStreetViewLinks(data.panorama.panoId);
+        if (links.length > 0 && data.panorama) {
+          data.panorama.links = links;
+        }
+      } catch (err) {
+        console.warn("Failed to fetch links:", err);
+        // Continue without links
+      }
+    }
+
+    panel.innerHTML = "";
+    panel.appendChild(createStreetResultSection(data));
+    
+    // If indoor with links, set up navigation mode
+    if (data?.indoorLikely && data?.panorama?.links && data.panorama.links.length > 0) {
+      state.quickStreet.navigationMode = "indoor-graph";
+      state.quickStreet.currentNode = {
+        panoId: data.panorama.panoId,
+        lat: data.panorama.lat,
+        lon: data.panorama.lon,
+        isIndoor: true,
+        links: data.panorama.links,
+        providerHint: data.panorama.providerHint || null
+      };
+      state.quickStreet.availableLinks = data.panorama.links;
+      state.quickStreet.nodeHistory = [];
+      
+      // Show indoor navigation UI
+      panel.appendChild(renderIndoorNavigation(state.quickStreet.currentNode, panel));
+    } else {
+      state.quickStreet.navigationMode = "outdoor-linear";
+      state.quickStreet.currentNode = null;
+      state.quickStreet.availableLinks = [];
+      state.quickStreet.nodeHistory = [];
+    }
+    
+    state.quickStreet.indoorCandidates = [];
+    state.quickStreet.selectedCandidateIndex = -1;
+
+    const advBtn = $("quickStreetAdvanceBtn");
+    if (advBtn) {
+      advBtn.style.display = state.quickStreet.navigationMode === "outdoor-linear" ? "block" : "none";
+    }
+    
     state.quickStreet.loaded = true;
     state.quickStreet.offset = 0;
     state.quickStreet.maxDistance = Number(row.distanceToNext) || 0;
@@ -900,6 +1557,7 @@ async function runQuickStreetDetail() {
     state.quickStreet.lat = 0;
     state.quickStreet.lon = 0;
     state.quickStreet.heading = 0;
+    state.quickStreet.navigationMode = "outdoor-linear";
     refreshQuickStreetAdvanceButton();
   }
 }
@@ -952,11 +1610,8 @@ async function runQuickStreetAdvance() {
       state.queryCache.set(key, data);
     }
 
-    const section = [
-      tf("advanceSectionLabel", { distance: nextOffset }),
-      extractStreetBlocks(data.text),
-    ].join("\n");
-    panel.textContent = panel.textContent ? `${panel.textContent}\n\n${section}` : section;
+    const section = createStreetResultSection(data, tf("advanceSectionLabel", { distance: nextOffset }));
+    panel.appendChild(section);
 
     state.quickStreet.offset = nextOffset;
     refreshQuickStreetAdvanceButton();
@@ -988,10 +1643,25 @@ function focusIntersection(index, scrollIntoView = true, focusCard = true) {
   void warmupAdjacentOsmRoutePlaces(nextIndex, 2);
 }
 
+function setBusy(btn, busy) {
+  if (!btn) return;
+  if (busy) {
+    btn.disabled = true;
+    btn.dataset.originalText = btn.textContent;
+    btn.textContent = t("loading");
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.originalText !== undefined) {
+      btn.textContent = btn.dataset.originalText;
+      delete btn.dataset.originalText;
+    }
+  }
+}
+
 async function loadRoadByName(roadName, options = {}) {
   const btn = $("loadRoadBtn");
-  setBusy(btn, true);
   try {
+    setBusy(btn, true);
     if (!roadName) {
       throw new Error(t("enterRoadFirst"));
     }
@@ -1016,7 +1686,12 @@ async function loadRoadByName(roadName, options = {}) {
       geocodeNotice = tf("geocodeFail", { country: countryCode, message: geoErr.message });
     }
 
-    const data = await postJson("/api/overpass/segment", { roadName: resolvedRoadName, countryCode });
+    const segmentPayload = { roadName: resolvedRoadName, countryCode };
+    if (geocodeFocusPoint) {
+      segmentPayload.focusLat = geocodeFocusPoint.lat;
+      segmentPayload.focusLon = geocodeFocusPoint.lon;
+    }
+    const data = await postJson("/api/overpass/segment", segmentPayload);
     state.searchAttempted = true;
     state.roadName = data.roadName || roadName;
     state.intersections = data.intersections || [];
@@ -1073,8 +1748,179 @@ function destinationPoint(lat, lon, bearingDeg, distMeters) {
 }
 
 function extractStreetBlocks(text) {
-  const idx = String(text || "").indexOf("\n\n");
-  return idx >= 0 ? text.slice(idx + 2).trim() : String(text || "").trim();
+  const raw = String(text || "");
+  const idx = raw.indexOf("\n\n");
+  const body = idx >= 0 ? raw.slice(idx + 2).trim() : raw.trim();
+  return sanitizeStreetSummaryText(body);
+}
+
+function getStreetScenes(data) {
+  if (!data || !Array.isArray(data.scenes)) return [];
+  return data.scenes
+    .map((scene) => ({
+      label: String(scene?.label || ""),
+      heading: Number(scene?.heading || 0),
+      description: String(scene?.description || "").trim(),
+      imageUrl: String(scene?.imageUrl || "").trim(),
+    }))
+    .filter((scene) => scene.label && scene.imageUrl);
+}
+
+function createStreetResultSection(data, titleText = "") {
+  const section = document.createElement("div");
+  section.className = "street-section";
+
+  if (titleText) {
+    const label = document.createElement("div");
+    label.className = "street-advance-label";
+    label.textContent = titleText;
+    section.appendChild(label);
+  }
+
+  if (!data || data.hasStreetView === false) {
+    const empty = document.createElement("div");
+    empty.textContent = extractStreetBlocks(data?.text || "");
+    section.appendChild(empty);
+    return section;
+  }
+
+  const intro = document.createElement("div");
+  intro.className = "street-summary";
+  intro.textContent = extractStreetBlocks(data?.text || "");
+  section.appendChild(intro);
+
+  const scenes = getStreetScenes(data);
+  if (!scenes.length) {
+    return section;
+  }
+
+  const viewer = document.createElement("div");
+  viewer.className = "street-pano-viewer";
+
+  const img = document.createElement("img");
+  img.className = "street-pano-image";
+  img.alt = "Street View panorama scene";
+  img.loading = "lazy";
+
+  const caption = document.createElement("div");
+  caption.className = "street-pano-caption";
+
+  const sceneButtons = document.createElement("div");
+  sceneButtons.className = "street-scene-buttons";
+
+  const llmSummary = document.createElement("div");
+  llmSummary.className = "street-pano-caption";
+
+  let activeIndex = 0;
+  const applyScene = () => {
+    const scene = scenes[activeIndex];
+    img.src = scene.imageUrl;
+    const headingLabel = `${scene.label} (${Math.round(scene.heading)}°)`;
+    caption.textContent = isDisabledLlmDescription(scene.description) || !scene.description
+      ? headingLabel
+      : `${headingLabel}: ${scene.description}`;
+    for (let i = 0; i < sceneButtons.children.length; i += 1) {
+      const btn = sceneButtons.children[i];
+      if (btn instanceof HTMLButtonElement) {
+        btn.classList.toggle("active", i === activeIndex);
+      }
+    }
+  };
+
+  scenes.forEach((scene, idx) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "street-scene-btn";
+    btn.textContent = `${scene.label} (${Math.round(scene.heading)}°)`;
+    btn.addEventListener("click", () => {
+      activeIndex = idx;
+      applyScene();
+    });
+    sceneButtons.appendChild(btn);
+  });
+
+  const describeBtn = document.createElement("button");
+  describeBtn.type = "button";
+  describeBtn.className = "street-scene-btn paid";
+  describeBtn.textContent = t("indoorDescribeEnv");
+  describeBtn.addEventListener("click", async () => {
+    const blocked = getPaidBlockedMessage();
+    if (blocked) {
+      llmSummary.textContent = blocked;
+      announceLive(blocked);
+      return;
+    }
+    describeBtn.disabled = true;
+    llmSummary.textContent = t("indoorDescribeLoading");
+    announceLive(t("indoorDescribeLoading"));
+    try {
+      const imageBase64 = await composePanoramaStripBase64(scenes);
+      const result = await postJson("/api/paid/streetview/panorama-describe", {
+        userConfirmedPaidCall: true,
+        language: getMapLanguage(),
+        imageBase64,
+      });
+      const resultText = tf("indoorDescribeResult", { text: String(result.description || "").trim() });
+      llmSummary.textContent = resultText;
+      announceLive(resultText);
+    } catch (err) {
+      const msg = `${t("errorPrefix")}${err.message}`;
+      llmSummary.textContent = msg;
+      announceLive(msg);
+    } finally {
+      describeBtn.disabled = false;
+    }
+  });
+  sceneButtons.appendChild(describeBtn);
+
+  viewer.appendChild(img);
+  viewer.appendChild(sceneButtons);
+  viewer.appendChild(caption);
+  viewer.appendChild(llmSummary);
+  section.appendChild(viewer);
+
+  if (data?.indoorLikely) {
+    const indoorHint = document.createElement("div");
+    indoorHint.className = "minor";
+    indoorHint.textContent = "Indoor panorama likely";
+    section.appendChild(indoorHint);
+  }
+
+  applyScene();
+  return section;
+}
+
+function loadImageForCompose(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load panorama image"));
+    img.src = url;
+  });
+}
+
+async function composePanoramaStripBase64(scenes) {
+  const useScenes = scenes.slice(0, 4);
+  if (!useScenes.length) {
+    throw new Error("No panorama scenes available");
+  }
+  const images = await Promise.all(useScenes.map((scene) => loadImageForCompose(scene.imageUrl)));
+  const baseWidth = Number(images[0].naturalWidth || images[0].width || 640);
+  const baseHeight = Number(images[0].naturalHeight || images[0].height || 480);
+  const canvas = document.createElement("canvas");
+  canvas.width = baseWidth * images.length;
+  canvas.height = baseHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Canvas context unavailable");
+  }
+  for (let i = 0; i < images.length; i += 1) {
+    ctx.drawImage(images[i], i * baseWidth, 0, baseWidth, baseHeight);
+  }
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+  const idx = dataUrl.indexOf(",");
+  return idx >= 0 ? dataUrl.slice(idx + 1) : dataUrl;
 }
 
 function getCurrentPosition() {
@@ -1093,7 +1939,9 @@ function getCurrentPosition() {
 
 async function loadRoadFromCurrentLocation() {
   const btn = $("useGpsBtn");
-  setBusy(btn, true);
+  try {
+    setBusy(btn, true);
+  } catch {}
   $("roadSummary").classList.remove("error", "warning");
   $("roadSummary").textContent = t("gpsLocating");
   try {
@@ -1255,7 +2103,7 @@ function createCard(row, index, total) {
 
   const interval = getSampleInterval();
   const sampleCount = row.distanceToNext ? Math.max(1, Math.ceil(row.distanceToNext / interval)) : 0;
-  const streetUsd = 2 * (PRICES.streetViewStatic + PRICES.geminiGenerate);
+  const streetUsd = 2 * (PRICES.streetViewStatic + PRICES.llmGenerate);
   const googleRouteUsd = sampleCount * PRICES.placesNearby;
 
   const routeOsmDetails = document.createElement("details");
@@ -1291,9 +2139,26 @@ function createCard(row, index, total) {
   streetDetails.appendChild(streetResult);
   card.appendChild(streetDetails);
 
+  const indoorDetails = document.createElement("details");
+  indoorDetails.className = "query-details";
+  const indoorSummary = document.createElement("summary");
+  indoorSummary.className = "query-summary paid-summary";
+  indoorSummary.textContent = t("indoorNav");
+  indoorDetails.appendChild(indoorSummary);
+  const indoorResult = document.createElement("div");
+  indoorResult.className = "result";
+  indoorDetails.appendChild(indoorResult);
+  card.appendChild(indoorDetails);
+
   let streetLoading = false;
   let routeOsmLoading = false;
   let routeGoogleLoading = false;
+  let indoorLoading = false;
+
+  let indoorNode = null;
+  let indoorHistory = [];
+  let indoorCandidates = [];
+  let selectedIndoorCandidate = -1;
 
   const next = state.intersections[index + 1] || null;
   const routeOsmCacheKey = next
@@ -1329,10 +2194,7 @@ function createCard(row, index, total) {
       }
 
       streetResult.innerHTML = "";
-      const initSection = document.createElement("div");
-      initSection.className = "street-section";
-      const initBlocks = extractStreetBlocks(data.text);
-      initSection.textContent = initBlocks;
+      const initSection = createStreetResultSection(data);
       streetResult.appendChild(initSection);
 
       const distToNext = Number(row.distanceToNext) || 0;
@@ -1380,15 +2242,7 @@ function createCard(row, index, total) {
             });
             state.queryCache.set(advCacheKey, advData);
           }
-          const advSection = document.createElement("div");
-          advSection.className = "street-section";
-          const advLabel = document.createElement("div");
-          advLabel.className = "street-advance-label";
-          advLabel.textContent = tf("advanceSectionLabel", { distance: advanceOffset });
-          advSection.appendChild(advLabel);
-          const advContent = document.createElement("div");
-          advContent.textContent = extractStreetBlocks(advData.text);
-          advSection.appendChild(advContent);
+          const advSection = createStreetResultSection(advData, tf("advanceSectionLabel", { distance: advanceOffset }));
           streetResult.insertBefore(advSection, advanceBtn);
           advSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
           refreshAdvanceBtn();
@@ -1408,6 +2262,206 @@ function createCard(row, index, total) {
       streetResult.textContent = `${t("errorPrefix")}${err.message}`;
     } finally {
       streetLoading = false;
+    }
+  }
+
+  function renderCardIndoorControls() {
+    const controls = document.createElement("div");
+    controls.className = "pano-links";
+
+    if (indoorHistory.length > 0) {
+      const backBtn = document.createElement("button");
+      backBtn.type = "button";
+      backBtn.className = "link-button";
+      backBtn.textContent = t("indoorBackPrev");
+      backBtn.addEventListener("click", async () => {
+        if (!indoorHistory.length) return;
+        const prev = indoorHistory.pop();
+        if (!prev?.panoId) return;
+        const prevData = await postJson("/api/paid/streetview", {
+          userConfirmedPaidCall: true,
+          panoId: prev.panoId,
+          lat: Number(prev.lat) || row.lat,
+          lon: Number(prev.lon) || row.lon,
+          heading: row.bearingToNext ?? 0,
+          fov: 90,
+          pitch: 0,
+          language: getMapLanguage(),
+          useLlm: false,
+        });
+        indoorNode = prev;
+        indoorResult.innerHTML = "";
+        indoorResult.appendChild(createStreetResultSection(prevData));
+        indoorResult.appendChild(renderCardIndoorControls());
+        const msg = t("indoorBackPrev");
+        announceLive(msg);
+        updateQuickNavStatus(msg);
+      });
+      controls.appendChild(backBtn);
+    }
+
+    if (indoorCandidates.length > 1) {
+      for (let i = 0; i < indoorCandidates.length; i += 1) {
+        const c = indoorCandidates[i];
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "link-button";
+        const active = i === selectedIndoorCandidate ? "*" : "";
+        let relativeDistance = Math.round(Number(c.distanceMeters) || 0);
+        if (indoorNode?.lat && indoorNode?.lon && c.node?.lat && c.node?.lon) {
+          relativeDistance = Math.round(haversineMeters(indoorNode.lat, indoorNode.lon, c.node.lat, c.node.lon));
+        }
+        const direction = c.bearing !== undefined ? bearingToCompass(c.bearing) : "?";
+        btn.textContent = `${active}入口 ${String.fromCharCode(65 + i)} (${relativeDistance}m) [${direction}]`;
+        btn.addEventListener("click", async () => {
+          if (!c?.node?.panoId) return;
+          if (indoorNode?.panoId && indoorNode.panoId !== c.node.panoId) {
+            indoorHistory.push(indoorNode);
+          }
+          const switched = await postJson("/api/paid/streetview", {
+            userConfirmedPaidCall: true,
+            panoId: c.node.panoId,
+            lat: Number(c.node.lat) || row.lat,
+            lon: Number(c.node.lon) || row.lon,
+            heading: row.bearingToNext ?? 0,
+            fov: 90,
+            pitch: 0,
+            language: getMapLanguage(),
+            useLlm: false,
+          });
+          indoorNode = c.node;
+          selectedIndoorCandidate = i;
+          indoorResult.innerHTML = "";
+          indoorResult.appendChild(createStreetResultSection(switched));
+          const hint = document.createElement("div");
+          hint.className = "minor";
+          const switchedMessage = tf("indoorSwitchedCandidate", {
+            label: String.fromCharCode(65 + i),
+            meters: Math.round(Number(c.distanceMeters) || 0),
+          });
+          hint.textContent = switchedMessage;
+          indoorResult.appendChild(hint);
+          indoorResult.appendChild(renderCardIndoorControls());
+          announceLive(switchedMessage);
+          updateQuickNavStatus(switchedMessage);
+        });
+        controls.appendChild(btn);
+      }
+    }
+
+    const stepDirections = [
+      { bearing: 0, key: "dirN" },
+      { bearing: 45, key: "dirNE" },
+      { bearing: 90, key: "dirE" },
+      { bearing: 135, key: "dirSE" },
+      { bearing: 180, key: "dirS" },
+      { bearing: 225, key: "dirSW" },
+      { bearing: 270, key: "dirW" },
+      { bearing: 315, key: "dirNW" },
+    ];
+    for (const dir of stepDirections) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "link-button";
+      btn.textContent = tf("indoorMoveBy", { direction: t(dir.key), meters: 5 });
+      btn.addEventListener("click", async () => {
+        if (!Number.isFinite(Number(indoorNode?.lat)) || !Number.isFinite(Number(indoorNode?.lon))) return;
+        const nextPos = destinationPoint(Number(indoorNode.lat), Number(indoorNode.lon), Number(dir.bearing), 5);
+        const movedData = await postJson("/api/paid/streetview", {
+          userConfirmedPaidCall: true,
+          lat: nextPos.lat,
+          lon: nextPos.lon,
+          heading: row.bearingToNext ?? 0,
+          fov: 90,
+          pitch: 0,
+          language: getMapLanguage(),
+          useLlm: false,
+        });
+        const movedPano = movedData?.panorama || {};
+        if (!movedPano.panoId) {
+          throw new Error(movedData?.text || "No nearby panorama found");
+        }
+        const links = await fetchStreetViewLinks(movedPano.panoId).catch(() => []);
+        if (indoorNode?.panoId) {
+          indoorHistory.push(indoorNode);
+        }
+        indoorNode = {
+          panoId: movedPano.panoId,
+          lat: Number.isFinite(Number(movedPano.lat)) ? Number(movedPano.lat) : nextPos.lat,
+          lon: Number.isFinite(Number(movedPano.lon)) ? Number(movedPano.lon) : nextPos.lon,
+          isIndoor: Boolean(movedData?.indoorLikely),
+          links,
+          providerHint: movedPano.providerHint || indoorNode?.providerHint || null,
+        };
+        indoorResult.innerHTML = "";
+        indoorResult.appendChild(createStreetResultSection(movedData));
+        indoorResult.appendChild(renderCardIndoorControls());
+        const movedMsg = tf("indoorMoveDone", { direction: t(dir.key), meters: 5 });
+        announceLive(movedMsg);
+        updateQuickNavStatus(movedMsg);
+      });
+      controls.appendChild(btn);
+    }
+
+    return controls;
+  }
+
+  async function runIndoorQuery() {
+    if (indoorLoading || !indoorDetails.open) return;
+    const blocked = getPaidBlockedMessage();
+    if (blocked) {
+      indoorResult.classList.add("error");
+      indoorResult.textContent = blocked;
+      return;
+    }
+    indoorLoading = true;
+    indoorResult.classList.remove("error");
+    indoorResult.textContent = t("queryLoading");
+    try {
+      const indoorCacheKey = `indoor:${state.roadName}:${row.id}:${state.uiLang}`;
+      let entry = state.queryCache.get(indoorCacheKey);
+      if (!entry) {
+        entry = await postJson("/api/streetview/find-indoor-entry", {
+          lat: row.lat,
+          lon: row.lon,
+          radiusMeters: 220,
+        });
+        state.queryCache.set(indoorCacheKey, entry);
+      }
+
+      if (!entry.ok || !entry.found || !entry.node?.panoId) {
+        throw new Error(entry.error || t("indoorNoEntry"));
+      }
+
+      const targetData = await postJson("/api/paid/streetview", {
+        userConfirmedPaidCall: true,
+        panoId: entry.node.panoId,
+        lat: Number(entry.node.lat) || row.lat,
+        lon: Number(entry.node.lon) || row.lon,
+        heading: row.bearingToNext ?? 0,
+        fov: 90,
+        pitch: 0,
+        language: getMapLanguage(),
+        useLlm: false,
+      });
+
+      indoorNode = entry.node;
+      indoorHistory = [];
+      indoorCandidates = Array.isArray(entry.candidates) ? entry.candidates : [];
+      selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === entry.node.panoId);
+
+      indoorResult.innerHTML = "";
+      indoorResult.appendChild(createStreetResultSection(targetData));
+      const hint = document.createElement("div");
+      hint.className = "minor";
+      hint.textContent = tf("indoorSwitched", { meters: Math.round(Number(entry.distanceMeters) || 0) });
+      indoorResult.appendChild(hint);
+      indoorResult.appendChild(renderCardIndoorControls());
+    } catch (err) {
+      indoorResult.classList.add("error");
+      indoorResult.textContent = `${t("errorPrefix")}${err.message}`;
+    } finally {
+      indoorLoading = false;
     }
   }
 
@@ -1496,6 +2550,9 @@ function createCard(row, index, total) {
   streetDetails.addEventListener("toggle", () => {
     if (streetDetails.open) void runStreetQuery();
   });
+  indoorDetails.addEventListener("toggle", () => {
+    if (indoorDetails.open) void runIndoorQuery();
+  });
   routeOsmDetails.addEventListener("toggle", () => {
     if (routeOsmDetails.open) void runRouteOsmQuery();
   });
@@ -1511,10 +2568,26 @@ function renderIntersections() {
   container.innerHTML = "";
 
   if (!state.intersections.length) {
-    container.textContent = !state.searchAttempted ? t("noIntersectionsBefore") : (state.lastSearchWarning || t("noIntersectionsAfter"));
+    let msg;
+    if (!state.searchAttempted) {
+      msg = t("noIntersectionsBefore");
+    } else if (state.lastSearchWarning) {
+      msg = state.lastSearchWarning;
+    } else {
+      msg = t("noIntersectionsAfter");
+    }
+    const p = document.createElement("p");
+    p.className = "search-notice";
+    p.textContent = msg;
+    container.appendChild(p);
     $("quickNavOsm").textContent = "";
+    $("quickNavStreet").textContent = "";
+    if ($("quickNavIndoor")) {
+      $("quickNavIndoor").textContent = "";
+    }
     refreshQuickStreetButtonState();
     refreshQuickStreetAdvanceButton();
+    refreshQuickIndoorButtonState();
     return;
   }
 
@@ -1525,6 +2598,7 @@ function renderIntersections() {
   renderCosts();
   refreshQuickStreetButtonState();
   refreshQuickStreetAdvanceButton();
+  refreshQuickIndoorButtonState();
 }
 
 async function warmupIntersectionAddresses(maxItems = 8) {
@@ -1582,6 +2656,7 @@ $("uiLang").addEventListener("change", () => {
   state.uiLang = String($("uiLang").value || "zh-Hant");
   setStaticTexts();
   initCountryOptions();
+  syncCountryPreferenceByUiLang();
   renderIntersections();
   if (state.intersections.length > 0) {
     focusIntersection(state.focusedIndex, false, false);
@@ -1631,6 +2706,10 @@ $("quickStreetAdvanceBtn").addEventListener("click", () => {
   void runQuickStreetAdvance();
 });
 
+$("quickIndoorBtn").addEventListener("click", () => {
+  void runQuickIndoorNavigation();
+});
+
 $("quickNav").addEventListener("keydown", (event) => {
   const key = event.key;
   if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(key)) return;
@@ -1644,9 +2723,11 @@ $("quickNav").addEventListener("keydown", (event) => {
 state.uiLang = String($("uiLang").value || "zh-Hant");
 setStaticTexts();
 initCountryOptions();
+syncCountryPreferenceByUiLang();
 renderIntersections();
 refreshQuickStreetButtonState();
 refreshQuickStreetAdvanceButton();
+refreshQuickIndoorButtonState();
 
 // ── Debug helper ────────────────────────────────────────────────────────
 function dbg(_msg) {

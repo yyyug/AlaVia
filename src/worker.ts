@@ -93,6 +93,37 @@ type SoundscapeTileFeature = {
   properties: Record<string, unknown> | null;
 };
 
+// ── Indoor Navigation Types ────────────────────────────────────────────────
+type StreetViewLink = {
+  panoId: string;
+  heading: number;
+  description: string;
+  label?: string;
+};
+
+type PanoNode = {
+  panoId: string;
+  lat: number;
+  lon: number;
+  levelLabel?: string | null;
+  links: StreetViewLink[];
+  copyright?: string | null;
+  date?: string | null;
+  isIndoor: boolean;
+  providerHint?: string | null;
+};
+
+type LinkAnalysisResult = {
+  panoId: string;
+  heading: number;
+  description: string;
+  label: string;
+  cvAnalysis?: {
+    feature?: string; // 楼梯、电梯、通道、剪票口等
+    confidence?: number;
+  };
+};
+
 const DAY = 60 * 60 * 24;
 const TTL_365_DAYS = 365 * DAY;
 const CACHE_MAX_AGE_SECONDS = DAY;
@@ -116,6 +147,7 @@ const WEBHOOK_MAX_SKEW_SECONDS = 300;
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const RATE_LIMIT_DEFAULT_PER_WINDOW = 120;
 const RATE_LIMIT_PAID_PER_WINDOW = 30;
+const BUILTIN_ADMIN_EMAILS = new Set(["yoofun@gmail.com"]);
 
 const PRICES = {
   placesNearby: 0.005,
@@ -165,8 +197,23 @@ export default {
     if (url.pathname === "/api/paid/streetview" && request.method === "POST") {
       return withErrorHandling(() => handlePaidStreetView(request, env, ctx));
     }
+    if (url.pathname === "/api/paid/streetview/panorama-describe" && request.method === "POST") {
+      return withErrorHandling(() => handlePaidStreetViewPanoramaDescribe(request, env));
+    }
     if (url.pathname === "/api/streetview/metadata" && request.method === "POST") {
       return withErrorHandling(() => handleStreetViewMetadata(request, env));
+    }
+    if (url.pathname === "/api/streetview/resolve-pano" && request.method === "POST") {
+      return withErrorHandling(() => handleResolveStreetViewPano(request, env));
+    }
+    if (url.pathname === "/api/streetview/find-indoor-entry" && request.method === "POST") {
+      return withErrorHandling(() => handleFindNearbyIndoorEntry(request, env, ctx));
+    }
+    if (url.pathname === "/api/streetview/analyze-link" && request.method === "POST") {
+      return withErrorHandling(() => handleAnalyzeStreetViewLink(request, env, ctx));
+    }
+    if (url.pathname === "/api/config/maps-key" && request.method === "POST") {
+      return withErrorHandling(() => handleGetMapsKey(request, env));
     }
     if (url.pathname === "/api/admin/cleanup-noimage" && request.method === "POST") {
       return withErrorHandling(() => handleCleanupNoImage(request, env));
@@ -268,17 +315,33 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
       }
     }
   } else if (normalizedCountry) {
-    const filteredItems = await fetchNominatimSearch(query, normalizedCountry);
-    if (filteredItems.length > 0) {
-      items = filteredItems;
-      resolvedCountryCode = normalizedCountry;
+    // Try multiple query variants for better CJK compatibility
+    const queryVariants = buildQueryVariants(query);
+    for (const q of queryVariants) {
+      const filteredItems = await fetchNominatimSearch(q, normalizedCountry);
+      if (filteredItems.length > 0) {
+        items = filteredItems;
+        resolvedCountryCode = normalizedCountry;
+        break;
+      }
+    }
+    // Fallback: try without country filter
+    if (!items.length) {
+      for (const q of queryVariants) {
+        const anyItems = await fetchNominatimSearch(q, "");
+        if (anyItems.length > 0) {
+          items = anyItems;
+          resolvedCountryCode = normalizedCountry;
+          break;
+        }
+      }
     }
   } else {
     items = await fetchNominatimSearch(query, "");
   }
 
   if (!Array.isArray(items) || items.length === 0) {
-    throw new Error("Geocode no result");
+    throw new Error(`Geocode no result for query "${query}" (country: ${countryCode || "any"})`);
   }
 
   const first = items[0] || {};
@@ -357,6 +420,8 @@ async function handleGeocodeReverseRoad(request: Request, env: Env, ctx: Executi
   }
 
   const address = ((reverse.address || {}) as Json);
+  const houseNumber = String(address.house_number || "").trim();
+  
   return json({
     ok: true,
     lat: round6(lat),
@@ -365,6 +430,8 @@ async function handleGeocodeReverseRoad(request: Request, env: Env, ctx: Executi
     displayName: String(reverse.display_name || roadName),
     country: String(address.country || "").trim(),
     countryCode: String(address.country_code || "").trim().toUpperCase() || null,
+    houseNumber: houseNumber || null,
+    streetName: roadName || null,
   });
 }
 
@@ -449,10 +516,15 @@ async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionC
   const body = await requireJson(request);
   const roadName = String(body.roadName || "").trim();
   const countryCode = String(body.countryCode || "").trim().toLowerCase();
+  const focusLat = body.focusLat !== undefined ? Number(body.focusLat) : null;
+  const focusLon = body.focusLon !== undefined ? Number(body.focusLon) : null;
   if (!roadName) {
     throw new Error("roadName is required");
   }
-  const data = await fetchSegmentData(env, ctx, roadName, countryCode);
+  const focusPoint = (focusLat !== null && focusLon !== null && Number.isFinite(focusLat) && Number.isFinite(focusLon))
+    ? { lat: focusLat, lon: focusLon }
+    : undefined;
+  const data = await fetchSegmentData(env, ctx, roadName, countryCode, focusPoint);
   return json(data);
 }
 
@@ -484,7 +556,13 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
   });
 }
 
-async function fetchSegmentData(env: Env, ctx: ExecutionContext, roadName: string, countryCode: string): Promise<Json> {
+async function fetchSegmentData(
+  env: Env,
+  ctx: ExecutionContext,
+  roadName: string,
+  countryCode: string,
+  focusPoint?: { lat: number; lon: number },
+): Promise<Json> {
   await ensureD1Schema(env);
   // Cache key uses only normalized road name — no bbox — so repeated queries for
   // the same road always hit the same cache entry regardless of Nominatim variance.
@@ -500,7 +578,8 @@ async function fetchSegmentData(env: Env, ctx: ExecutionContext, roadName: strin
     cachePayload,
     async () => {
       // Nominatim + Overpass are only called on a true cache miss.
-      const geo = await resolveRoadBBox(roadName, countryCode);
+      // Use the client-provided focusPoint if available to skip the extra Nominatim call.
+      const geo = await resolveRoadBBox(roadName, countryCode, focusPoint);
       const south = geo.bbox.south;
       const west = geo.bbox.west;
       const north = geo.bbox.north;
@@ -856,9 +935,7 @@ function buildOsmTileQuery(bbox: BBox): string {
   node["tourism"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   way["building"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
 );
-out body tags;
->;
-out skel qt;
+out body geom;
 `;
 }
 
@@ -1559,9 +1636,7 @@ function buildOsmBBoxPlaceQuery(bbox: BBox): string {
 (
 ${buildOsmPlaceStatements(`(${bbox.south},${bbox.west},${bbox.north},${bbox.east})`)}
 );
-out body tags;
->;
-out skel qt;
+out body geom;
 `;
 }
 
@@ -2202,7 +2277,16 @@ async function withErrorHandling(fn: () => Promise<Response>): Promise<Response>
 }
 
 async function enforceGatewayPolicies(request: Request, env: Env, path: string): Promise<void> {
-  enforceAllowedAccessEmails(request, env);
+  const requireAccessIdentity =
+    path.startsWith("/api/paid/") ||
+    path.startsWith("/api/google/") ||
+    path.startsWith("/api/admin/") ||
+    path.startsWith("/api/me") ||
+    path.startsWith("/api/billing/");
+
+  if (requireAccessIdentity) {
+    enforceAllowedAccessEmails(request, env);
+  }
   const pathGroup =
     path.startsWith("/api/paid/") || path.startsWith("/api/google/") ? "paid" : "default";
   const perWindow = pathGroup === "paid" ? RATE_LIMIT_PAID_PER_WINDOW : RATE_LIMIT_DEFAULT_PER_WINDOW;
@@ -2432,8 +2516,8 @@ async function getClerkUserMeta(
     email_addresses?: Array<{ email_address: string }>;
   };
   const approved = user.public_metadata?.approved === true;
-  const isAdmin = user.public_metadata?.role === "admin";
   const email = user.email_addresses?.[0]?.email_address || "";
+  const isAdmin = user.public_metadata?.role === "admin" || BUILTIN_ADMIN_EMAILS.has(email.toLowerCase());
   const result = { approved, email, isAdmin };
   await getEdgeCache().put(
     edgeReq,
@@ -2593,19 +2677,58 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
   const body = await requireJson(request);
   requireUserConfirmedPaidCall(body);
 
-  const lat = Number(body.lat);
-  const lon = Number(body.lon);
+  const lat = Number(body.lat ?? 0);
+  const lon = Number(body.lon ?? 0);
+  const panoId = String(body.panoId || "").trim() || null;
   const heading = Number(body.heading ?? 0);
   const fov = Number(body.fov ?? 90);
   const pitch = Number(body.pitch ?? 0);
   const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
-  validateCoordinates(lat, lon);
+  const useLlm = body.useLlm !== false;
   const mapsKey = requireGoogleMapsKey(env);
-  const geminiKey = requireGeminiKey(env);
+  const llmKey = useLlm ? requireGeminiKey(env) : null;
+
+  // Support both panoId-based and lat/lon-based requests
+  let metadata: StreetViewMetadataDetails;
+  
+  if (panoId) {
+    // If panoId provided, fetch metadata with a dummy coordinate (or extract from cache)
+    // For simplicity, we'll just create a minimal metadata object
+    // In production, you might cache pano metadata separately
+    metadata = {
+      status: "OK",
+      panoId,
+      lat: round6(lat),
+      lon: round6(lon),
+      copyright: null,
+      date: null,
+    };
+  } else {
+    // Traditional lat/lon lookup
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      throw new Error("panoId or (lat,lon) is required");
+    }
+    validateCoordinates(lat, lon);
+    metadata = await fetchStreetViewMetadataDetails(mapsKey, round6(lat), round6(lon));
+  }
+
+  if (metadata.status === "ZERO_RESULTS" || metadata.status === "NOT_FOUND") {
+    return json({
+      ok: true,
+      provider: "streetview",
+      hasStreetView: false,
+      metadataStatus: metadata.status,
+      text: `此地點無 Street View 覆蓋（${metadata.status}）`,
+    });
+  }
+
+  const indoorLikely = panoId ? await detectIndoorPanoramaLikelyByPanoId(mapsKey, panoId) : await detectIndoorPanoramaLikely(mapsKey, metadata);
 
   const views = [
-    { label: "左側", heading: normalizeHeading(heading + 90) },
-    { label: "右側", heading: normalizeHeading(heading + 270) },
+    { label: "前方", heading: normalizeHeading(heading + 0) },
+    { label: "右方", heading: normalizeHeading(heading + 90) },
+    { label: "後方", heading: normalizeHeading(heading + 180) },
+    { label: "左方", heading: normalizeHeading(heading + 270) },
   ];
   let billableImages = 0;
   let billableGemini = 0;
@@ -2613,22 +2736,17 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
   let geminiCacheHits = 0;
 
   const blocks: string[] = [];
+  const scenes: Array<{ label: string; heading: number; description: string; imageUrl: string }> = [];
 
   for (const view of views) {
     const payload = {
       lat: round6(lat),
       lon: round6(lon),
+      panoId: metadata.panoId,
       heading: view.heading,
       fov,
       pitch,
     };
-
-    const metaStatus = await fetchStreetViewMetadata(mapsKey, payload.lat, payload.lon);
-    if (metaStatus === "ZERO_RESULTS" || metaStatus === "NOT_FOUND") {
-      const visionText = `此地點無 Street View 覆蓋（${metaStatus}）`;
-      blocks.push(`${view.label}：${visionText}`);
-      continue;
-    }
 
     const imageCached = await getOrCreateCached(
       env,
@@ -2658,43 +2776,51 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
       language,
     };
 
-    const textCached = await getOrCreateCached(
-      env,
-      "streetview-gemini-text-v1",
-      textPayload,
-      async () => {
-        const imageObjectKey = String((imageCached.data as Json).imageObjectKey || "").trim();
-        if (!imageObjectKey) {
-          throw new Error("Street View image cache key is missing");
-        }
-        const imageObj = await env.CACHE_BUCKET.get(imageObjectKey);
-        if (!imageObj) {
-          throw new Error("Street View image cache not found");
-        }
-        const imageBytes = new Uint8Array(await imageObj.arrayBuffer());
-        const imageBase64 = bytesToBase64(imageBytes);
-        const description = await fetchGeminiDescription(geminiKey, imageBase64, language);
-        return { description };
-      },
-      TTL_365_DAYS,
-      {
-        ctx,
-        staleWhileRevalidateSeconds: 30 * DAY,
-      },
-    );
+    let visionText = "未啟用 LLM 描述";
+    if (useLlm) {
+      const textCached = await getOrCreateCached(
+        env,
+        "streetview-gemini-text-v1",
+        textPayload,
+        async () => {
+          const imageObjectKey = String((imageCached.data as Json).imageObjectKey || "").trim();
+          if (!imageObjectKey) {
+            throw new Error("Street View image cache key is missing");
+          }
+          const imageObj = await env.CACHE_BUCKET.get(imageObjectKey);
+          if (!imageObj) {
+            throw new Error("Street View image cache not found");
+          }
+          const imageBytes = new Uint8Array(await imageObj.arrayBuffer());
+          const imageBase64 = bytesToBase64(imageBytes);
+          const description = await fetchGeminiDescription(String(llmKey), imageBase64, language, {
+            viewLabel: view.label,
+            indoorLikely,
+          });
+          return { description };
+        },
+        TTL_365_DAYS,
+        {
+          ctx,
+          staleWhileRevalidateSeconds: 30 * DAY,
+        },
+      );
 
-    if (textCached.cacheHit) {
-      geminiCacheHits += 1;
-    } else {
-      billableGemini += 1;
+      if (textCached.cacheHit) {
+        geminiCacheHits += 1;
+      } else {
+        billableGemini += 1;
+      }
+
+      visionText = String((textCached.data as Json).description || "未取得完整描述");
     }
-
-    const visionText = String((textCached.data as Json).description || "未取得完整描述");
+    const sceneImageUrl = String((imageCached.data as Json).imageUrl || "");
     blocks.push(`${view.label}：${visionText}`);
+    scenes.push({ label: view.label, heading: view.heading, description: visionText, imageUrl: sceneImageUrl });
   }
 
-  const estimatedCalls = views.length * 2;
-  const estimatedUsd = views.length * (PRICES.streetViewStatic + PRICES.geminiGenerate);
+  const estimatedCalls = views.length * (useLlm ? 2 : 1);
+  const estimatedUsd = views.length * (PRICES.streetViewStatic + (useLlm ? PRICES.geminiGenerate : 0));
   const actualUsd = billableImages * PRICES.streetViewStatic + billableGemini * PRICES.geminiGenerate;
 
   await recordBilling(env, {
@@ -2706,10 +2832,10 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
   });
 
   const text = [
-    "街景詳細描述完成。",
+    indoorLikely ? "360 街景（疑似室內）詳細描述完成。" : "360 街景詳細描述完成。",
     `預估請求 ${estimatedCalls} 次，預估費用 $${estimatedUsd.toFixed(3)}。`,
     `Street View：新請求 ${billableImages} 次，圖片快取命中 ${imageCacheHits} 次。`,
-    `Gemini：新請求 ${billableGemini} 次，描述快取命中 ${geminiCacheHits} 次。`,
+    `LLM：新請求 ${billableGemini} 次，描述快取命中 ${geminiCacheHits} 次。`,
     `實際費用 $${actualUsd.toFixed(3)}。`,
     "",
     ...blocks,
@@ -2718,6 +2844,18 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
   return json({
     ok: true,
     provider: "streetview",
+    hasStreetView: true,
+    metadataStatus: metadata.status,
+    indoorLikely,
+    panorama: {
+      panoId: metadata.panoId,
+      lat: metadata.lat,
+      lon: metadata.lon,
+      heading: normalizeHeading(heading),
+      copyright: metadata.copyright,
+      date: metadata.date,
+    },
+    scenes,
     estimatedCalls,
     billableCalls: billableImages + billableGemini,
     cacheHits: imageCacheHits + geminiCacheHits,
@@ -2749,6 +2887,37 @@ async function handleStreetViewMetadata(request: Request, env: Env): Promise<Res
     lon,
     metadataStatus: status,
     hasStreetView: status === "OK",
+  });
+}
+
+async function handlePaidStreetViewPanoramaDescribe(request: Request, env: Env): Promise<Response> {
+  const clerkUser = await requireClerkAuth(request, env);
+  const body = await requireJson(request);
+  requireUserConfirmedPaidCall(body);
+
+  const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
+  const rawImage = String(body.imageBase64 || "").trim();
+  const imageBase64 = rawImage.includes(",") ? rawImage.split(",").pop() || "" : rawImage;
+
+  if (!imageBase64 || imageBase64.length < 1000) {
+    throw new Error("imageBase64 is required");
+  }
+
+  const geminiKey = requireGeminiKey(env);
+  const description = await fetchGeminiPanoramaDescription(geminiKey, imageBase64, language);
+
+  await recordBilling(env, {
+    provider: "streetview-panorama-description",
+    cacheHit: 0,
+    estimatedUsd: PRICES.geminiGenerate,
+    actualUsd: PRICES.geminiGenerate,
+    userId: clerkUser.userId,
+  });
+
+  return json({
+    ok: true,
+    description,
+    estimatedUsd: PRICES.geminiGenerate,
   });
 }
 
@@ -3155,7 +3324,7 @@ function tokenizeRoadQuery(name: string): string[] {
 }
 
 function collectWayNames(tags: Json): string[] {
-  const keys = ["name", "name:zh", "name:en", "official_name", "alt_name", "short_name"];
+  const keys = ["name", "name:zh", "name:ja", "name:en", "official_name", "alt_name", "short_name"];
   const out: string[] = [];
   for (const key of keys) {
     const v = String(tags[key] || "").trim();
@@ -3271,7 +3440,7 @@ async function handlePaidRouteScenery(request: Request, env: Env, _ctx: Executio
   const text = [
     `沿路景物描述完成，每 ${intervalMeters}m 採樣，共 ${points.length} 點。`,
     `預估請求 ${estimatedCalls} 次，預估費用 $${estimatedUsd.toFixed(3)}。`,
-    `實際計費影像 ${billableImages} 次，Gemini ${billableGemini} 次，cache 命中 ${cacheHits} 次。`,
+    `實際計費影像 ${billableImages} 次，LLM ${billableGemini} 次，cache 命中 ${cacheHits} 次。`,
     `實際費用 $${actualUsd.toFixed(3)}。`,
     "",
     ...lines,
@@ -3291,7 +3460,7 @@ async function handlePaidRouteScenery(request: Request, env: Env, _ctx: Executio
 
 function buildStreetViewUrl(
   apiKey: string,
-  args: { lat: number; lon: number; heading: number; fov: number; pitch: number; language: string },
+  args: { lat: number; lon: number; heading: number; fov: number; pitch: number; language: string; panoId?: string | null },
 ): string {
   const p = new URLSearchParams({
     size: "640x480",
@@ -3302,12 +3471,18 @@ function buildStreetViewUrl(
     language: args.language,
     key: apiKey,
   });
+  if (args.panoId) {
+    p.set("pano", args.panoId);
+  }
   return `https://maps.googleapis.com/maps/api/streetview?${p.toString()}`;
 }
 
-async function fetchStreetViewMetadata(apiKey: string, lat: number, lon: number): Promise<string> {
+async function fetchStreetViewMetadata(apiKey: string, lat: number, lon: number, source?: "outdoor"): Promise<string> {
   try {
     const p = new URLSearchParams({ location: `${lat},${lon}`, key: apiKey });
+    if (source) {
+      p.set("source", source);
+    }
     const url = `https://maps.googleapis.com/maps/api/streetview/metadata?${p.toString()}`;
     const res = await fetchWithTimeout(url, {}, 8000);
     if (!res.ok) return "API_ERROR";
@@ -3316,6 +3491,57 @@ async function fetchStreetViewMetadata(apiKey: string, lat: number, lon: number)
   } catch {
     return "API_ERROR";
   }
+}
+
+type StreetViewMetadataDetails = {
+  status: string;
+  panoId: string | null;
+  lat: number;
+  lon: number;
+  copyright: string | null;
+  date: string | null;
+};
+
+async function fetchStreetViewMetadataDetails(apiKey: string, lat: number, lon: number): Promise<StreetViewMetadataDetails> {
+  try {
+    const p = new URLSearchParams({ location: `${lat},${lon}`, key: apiKey });
+    const url = `https://maps.googleapis.com/maps/api/streetview/metadata?${p.toString()}`;
+    const res = await fetchWithTimeout(url, {}, 8000);
+    if (!res.ok) {
+      return { status: "API_ERROR", panoId: null, lat, lon, copyright: null, date: null };
+    }
+
+    const body = (await res.json()) as Json;
+    const location = (body.location || {}) as Json;
+    return {
+      status: String(body.status || "UNKNOWN"),
+      panoId: String(body.pano_id || "").trim() || null,
+      lat: Number.isFinite(Number(location.lat)) ? Number(location.lat) : lat,
+      lon: Number.isFinite(Number(location.lng)) ? Number(location.lng) : lon,
+      copyright: String(body.copyright || "").trim() || null,
+      date: String(body.date || "").trim() || null,
+    };
+  } catch {
+    return { status: "API_ERROR", panoId: null, lat, lon, copyright: null, date: null };
+  }
+}
+
+async function detectIndoorPanoramaLikely(apiKey: string, meta: StreetViewMetadataDetails): Promise<boolean> {
+  const sourceText = `${meta.copyright || ""} ${meta.panoId || ""}`.toLowerCase();
+  const vendorIndoorHints = ["metro", "station", "mall", "airport", "jr", "rail", "terminal", "subway"];
+  if (vendorIndoorHints.some((hint) => sourceText.includes(hint))) {
+    return true;
+  }
+
+  const outdoorStatus = await fetchStreetViewMetadata(apiKey, meta.lat, meta.lon, "outdoor");
+  return meta.status === "OK" && (outdoorStatus === "ZERO_RESULTS" || outdoorStatus === "NOT_FOUND");
+}
+
+async function detectIndoorPanoramaLikelyByPanoId(apiKey: string, panoId: string): Promise<boolean> {
+  // For panoId-only detection, check if the panoId itself contains indoor hints
+  const sourceText = panoId.toLowerCase();
+  const vendorIndoorHints = ["metro", "station", "mall", "airport", "jr", "rail", "terminal", "subway", "indoor"];
+  return vendorIndoorHints.some((hint) => sourceText.includes(hint));
 }
 
 async function fetchImageBytes(imageUrl: string): Promise<Uint8Array> {
@@ -3414,13 +3640,23 @@ function normalizeMapsLanguage(value: string): string {
   return "zh-TW";
 }
 
-async function fetchGeminiDescription(apiKey: string, imageBase64: string, language: string): Promise<string> {
+async function fetchGeminiDescription(
+  apiKey: string,
+  imageBase64: string,
+  language: string,
+  options?: { viewLabel?: string; indoorLikely?: boolean },
+): Promise<string> {
+  const viewLabel = String(options?.viewLabel || "").trim();
   const prompt = [
     `Please answer in ${language} and provide 1 to 3 complete sentences.`,
+    viewLabel ? `Current panorama direction: ${viewLabel}.` : "",
     "Focus on: shops, shop names, building, and traffic lights/pedestrian facilities (omit this part if none are visible).",
+    options?.indoorLikely
+      ? "This panorama is likely indoor; prioritize indoor wayfinding landmarks such as exits, gates, stairs, escalators, elevators, platforms, and corridor branching."
+      : "",
     "If uncertain, clearly say it may be the case or cannot be fully confirmed.",
     "Do not output lists or JSON.",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   const reqBody = {
     contents: [
@@ -3457,7 +3693,7 @@ async function fetchGeminiDescription(apiKey: string, imageBase64: string, langu
   const body = (await res.json().catch(() => ({}))) as Json;
   if (!res.ok) {
     const errMsg = extractGoogleErrorMessage(body) || `HTTP ${res.status}`;
-    throw new Error(`Gemini 失敗：${errMsg}`);
+    throw new Error(`LLM 失敗：${errMsg}`);
   }
 
   const candidates = Array.isArray(body.candidates) ? (body.candidates as Json[]) : [];
@@ -3466,7 +3702,70 @@ async function fetchGeminiDescription(apiKey: string, imageBase64: string, langu
   const parts = Array.isArray(content.parts) ? (content.parts as Json[]) : [];
   const text = parts.map((p) => String(p.text || "").trim()).filter(Boolean).join("\n").trim();
   if (!text) {
-    throw new Error("Gemini 回傳內容為空");
+    throw new Error("LLM 回傳內容為空");
+  }
+  return text;
+}
+
+async function fetchGeminiPanoramaDescription(
+  apiKey: string,
+  imageBase64: string,
+  language: string,
+): Promise<string> {
+  const prompt = [
+    `Please answer in ${language} and provide 2 to 4 complete sentences.`,
+    "This is a stitched 360-degree indoor panorama strip (left-to-right sequence of multiple directions).",
+    "Describe the surrounding environment for blind or low-vision wayfinding users.",
+    "Focus on practical landmarks: exits, stairs/escalators/elevators, gates, counters, corridor branching, and readable signs.",
+    "If a detail is uncertain, explicitly state uncertainty.",
+    "Do not output lists or JSON.",
+  ].join("\n");
+
+  const reqBody = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: prompt },
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: imageBase64,
+            },
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 320,
+    },
+  };
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(reqBody),
+    },
+    30000,
+  );
+
+  const body = (await res.json().catch(() => ({}))) as Json;
+  if (!res.ok) {
+    const errMsg = extractGoogleErrorMessage(body) || `HTTP ${res.status}`;
+    throw new Error(`LLM 失敗：${errMsg}`);
+  }
+
+  const candidates = Array.isArray(body.candidates) ? (body.candidates as Json[]) : [];
+  const first = candidates[0] || {};
+  const content = (first.content || {}) as Json;
+  const parts = Array.isArray(content.parts) ? (content.parts as Json[]) : [];
+  const text = parts.map((p) => String(p.text || "").trim()).filter(Boolean).join("\n").trim();
+  if (!text) {
+    throw new Error("LLM 回傳內容為空");
   }
   return text;
 }
@@ -3676,13 +3975,16 @@ async function handleAdminListUsers(request: Request, env: Env): Promise<Respons
     public_metadata?: { approved?: boolean; role?: string };
     created_at: number;
   }>;
-  const result = users.map((u) => ({
-    userId: u.id,
-    email: u.email_addresses?.[0]?.email_address || "",
-    approved: u.public_metadata?.approved === true,
-    isAdmin: u.public_metadata?.role === "admin",
-    createdAt: u.created_at,
-  }));
+  const result = users.map((u) => {
+    const email = u.email_addresses?.[0]?.email_address || "";
+    return {
+      userId: u.id,
+      email,
+      approved: u.public_metadata?.approved === true,
+      isAdmin: u.public_metadata?.role === "admin" || BUILTIN_ADMIN_EMAILS.has(email.toLowerCase()),
+      createdAt: u.created_at,
+    };
+  });
   return json({ ok: true, users: result });
 }
 
@@ -3742,7 +4044,25 @@ async function handleAdminBillingSummary(request: Request, env: Env): Promise<Re
   });
 }
 
-async function resolveRoadBBox(roadName: string, countryCode: string): Promise<{ bbox: BBox }> {
+async function resolveRoadBBox(
+  roadName: string,
+  countryCode: string,
+  focusPoint?: { lat: number; lon: number },
+): Promise<{ bbox: BBox }> {
+  // If a trusted focus point was provided by the caller (e.g. already geocoded on the client),
+  // derive a sensible bbox from it directly and skip the Nominatim round-trip.
+  if (focusPoint && Number.isFinite(focusPoint.lat) && Number.isFinite(focusPoint.lon)) {
+    const radius = 0.012;
+    return {
+      bbox: {
+        south: focusPoint.lat - radius,
+        north: focusPoint.lat + radius,
+        west: focusPoint.lon - radius,
+        east: focusPoint.lon + radius,
+      },
+    };
+  }
+
   const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
   let items: Array<Record<string, unknown>> = [];
 
@@ -3760,13 +4080,30 @@ async function resolveRoadBBox(roadName: string, countryCode: string): Promise<{
       }
     }
   } else if (normalizedCountry) {
-    items = await fetchNominatimSearch(roadName, normalizedCountry);
+    const queryVariants = buildQueryVariants(roadName);
+    for (const q of queryVariants) {
+      const filteredItems = await fetchNominatimSearch(q, normalizedCountry);
+      if (filteredItems.length > 0) {
+        items = filteredItems;
+        break;
+      }
+    }
+    // Fallback: try without country filter
+    if (!items.length) {
+      for (const q of queryVariants) {
+        const anyItems = await fetchNominatimSearch(q, "");
+        if (anyItems.length > 0) {
+          items = anyItems;
+          break;
+        }
+      }
+    }
   } else {
     items = await fetchNominatimSearch(roadName, "");
   }
 
   if (!items.length) {
-    throw new Error("Geocode no result for road name");
+    throw new Error(`Geocode no result for road name "${roadName}" (country: ${countryCode || "any"})`);
   }
 
   const first = items[0] || {};
@@ -3802,6 +4139,429 @@ async function resolveRoadBBox(roadName: string, countryCode: string): Promise<{
   }
 
   return { bbox: { south, west, north, east } };
+}
+
+// ── Indoor Navigation: Resolve Pano + Links ───────────────────────────────
+async function handleResolveStreetViewPano(request: Request, env: Env): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const panoId = String(body.panoId || "").trim() || null;
+
+  if (!panoId && (!Number.isFinite(lat) || !Number.isFinite(lon))) {
+    throw new Error("panoId or (lat,lon) is required");
+  }
+
+  const mapsKey = requireGoogleMapsKey(env);
+  
+  let resolvedLat = lat;
+  let resolvedLon = lon;
+  let resolvedPanoId = panoId;
+  let copyright: string | null = null;
+  let date: string | null = null;
+
+  // If no panoId, resolve from coordinates first
+  if (!resolvedPanoId) {
+    const meta = await fetchStreetViewMetadataDetails(mapsKey, round6(lat), round6(lon));
+    if (meta.status !== "OK") {
+      return json({
+        ok: false,
+        error: `No Street View at ${lat},${lon}: ${meta.status}`,
+      });
+    }
+    resolvedPanoId = meta.panoId;
+    resolvedLat = meta.lat;
+    resolvedLon = meta.lon;
+    copyright = meta.copyright;
+    date = meta.date;
+  } else {
+    // If panoId provided, still fetch metadata to get coordinates
+    const meta = await fetchStreetViewMetadataDetails(mapsKey, round6(lat || 0), round6(lon || 0));
+    if (meta.panoId === resolvedPanoId) {
+      resolvedLat = meta.lat;
+      resolvedLon = meta.lon;
+      copyright = meta.copyright;
+      date = meta.date;
+    }
+  }
+
+  if (!resolvedPanoId) {
+    return json({
+      ok: false,
+      error: "Could not resolve pano ID",
+    });
+  }
+
+  // For now, return basic pano info without real links (since Metadata API doesn't expose links directly)
+  // In a production system, you'd use JS API on frontend to get links, or store them separately
+  const isIndoor = await detectIndoorPanoramaLikely(mapsKey, {
+    status: "OK",
+    panoId: resolvedPanoId,
+    lat: resolvedLat,
+    lon: resolvedLon,
+    copyright,
+    date,
+  });
+
+  const node: PanoNode = {
+    panoId: resolvedPanoId,
+    lat: resolvedLat,
+    lon: resolvedLon,
+    levelLabel: null,
+    links: [], // Will be populated by frontend using JS API
+    copyright,
+    date,
+    isIndoor,
+    providerHint: extractProviderFromCopyright(copyright),
+  };
+
+  return json({
+    ok: true,
+    node,
+  });
+}
+
+async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(40, Math.min(300, Number(body.radiusMeters ?? 220)));
+
+  validateCoordinates(lat, lon);
+  const mapsKey = requireGoogleMapsKey(env);
+
+  const origin = { lat: round6(lat), lon: round6(lon) };
+  const cachePayload: Json = {
+    lat: origin.lat,
+    lon: origin.lon,
+    radiusMeters,
+  };
+
+  const cached = await getOrCreateCached(
+    env,
+    "streetview-indoor-entry-v2",
+    cachePayload,
+    async () => {
+      const rings = [0, 30, 80, 140, radiusMeters].filter((d, i, arr) => arr.indexOf(d) === i);
+      const headings = [0, 90, 180, 270];
+      let checked = 0;
+      const scored: Array<{
+        score: number;
+        distanceMeters: number;
+        panoId: string;
+        lat: number;
+        lon: number;
+        indoor: boolean;
+        copyright: string | null;
+        date: string | null;
+        providerHint: string | null;
+      }> = [];
+      const seen = new Set<string>();
+
+      for (const ring of rings) {
+        if (ring > radiusMeters) continue;
+        const points =
+          ring === 0 ? [origin] : headings.map((h) => offsetPointByMeters(origin, normalizeHeading(h), ring));
+
+        for (const p of points) {
+          const meta = await fetchStreetViewMetadataDetails(mapsKey, round6(p.lat), round6(p.lon));
+          if (meta.status !== "OK" || !meta.panoId || seen.has(meta.panoId)) continue;
+          seen.add(meta.panoId);
+
+          checked += 1;
+          const text = `${meta.panoId || ""} ${meta.copyright || ""}`.toLowerCase();
+          const indoor = hasIndoorHintText(text);
+          const actualDistance = Math.round(haversineMeters(origin, { lat: meta.lat, lon: meta.lon }));
+          const stationBonus = hasStationHintText(text) ? 200 : 0;
+          const score = (indoor ? 1000 : 0) + stationBonus - actualDistance;
+
+          scored.push({
+            score,
+            distanceMeters: actualDistance,
+            panoId: meta.panoId,
+            lat: meta.lat,
+            lon: meta.lon,
+            indoor,
+            copyright: meta.copyright,
+            date: meta.date,
+            providerHint: extractProviderFromCopyright(meta.copyright),
+          });
+        }
+      }
+
+      scored.sort((a, b) => b.score - a.score || a.distanceMeters - b.distanceMeters);
+      const top = scored.slice(0, 3);
+
+      if (!top.length) {
+        return {
+          ok: true,
+          found: false,
+          checked,
+          error: "No nearby Street View panorama found",
+        } as Json;
+      }
+
+      const toNode = (item: {
+        panoId: string;
+        lat: number;
+        lon: number;
+        indoor: boolean;
+        copyright: string | null;
+        date: string | null;
+        providerHint: string | null;
+      }): PanoNode => ({
+        panoId: item.panoId,
+        lat: round6(item.lat),
+        lon: round6(item.lon),
+        levelLabel: null,
+        links: [],
+        copyright: item.copyright,
+        date: item.date,
+        isIndoor: item.indoor,
+        providerHint: item.providerHint,
+      });
+
+      const best = top[0];
+      const node = toNode(best);
+      const candidates = top.map((item, index) => ({
+        rank: index + 1,
+        distanceMeters: item.distanceMeters,
+        indoor: item.indoor,
+        score: item.score,
+        node: toNode(item),
+        bearing: Math.round(calculateBearing(lat, lon, item.lat, item.lon)),
+      }));
+
+      return {
+        ok: true,
+        found: true,
+        checked,
+        distanceMeters: best.distanceMeters,
+        node,
+        candidates,
+      } as Json;
+    },
+    30 * DAY,
+    { ctx, staleWhileRevalidateSeconds: 7 * DAY },
+  );
+
+  return json(cached.data);
+}
+
+// ── Analyze Link with LLM CV ────────────────────────────────────────────
+async function handleAnalyzeStreetViewLink(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const clerkUser = await requireClerkAuth(request, env);
+  const body = await requireJson(request);
+  requireUserConfirmedPaidCall(body);
+
+  const panoId = String(body.panoId || "").trim();
+  const heading = Number(body.heading ?? 0);
+  const description = String(body.description || "").trim();
+  const fov = Number(body.fov ?? 90);
+  const pitch = Number(body.pitch ?? 0);
+  const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
+
+  if (!panoId) {
+    throw new Error("panoId is required");
+  }
+
+  const mapsKey = requireGoogleMapsKey(env);
+  const geminiKey = requireGeminiKey(env);
+
+  // Build image URL using panoId directly
+  const imageUrl = buildStreetViewUrl(mapsKey, {
+    lat: 0,
+    lon: 0,
+    heading,
+    fov,
+    pitch,
+    language: "en",
+    panoId,
+  });
+
+  try {
+    const imageBytes = await fetchImageBytes(imageUrl);
+    const imageBase64 = bytesToBase64(imageBytes);
+
+    // Analyze with LLM for indoor wayfinding features
+    const cvPrompt = [
+      `Please answer in ${language} in 1-2 sentences.`,
+      `Looking at this direction (bearing: ${Math.round(heading)}°, description: "${description}"),`,
+      `identify what type of indoor wayfinding feature appears (e.g., staircase, escalator, elevator, exit sign, gate, corridor, ticket counter, platform).`,
+      `Also note if it's labeled "剪票口" (ticket gate) specifically, or any signage visible.`,
+      `Be concise and factual only.`,
+    ].join(" ");
+
+    const reqBody = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: cvPrompt },
+            {
+              inlineData: {
+                mimeType: "image/jpeg",
+                data: imageBase64,
+              },
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 120,
+      },
+    };
+
+    const res = await fetchWithTimeout(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${encodeURIComponent(geminiKey)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(reqBody),
+      },
+      30000,
+    );
+
+    const result = (await res.json().catch(() => ({}))) as Json;
+    if (!res.ok) {
+      const errMsg = extractGoogleErrorMessage(result) || `HTTP ${res.status}`;
+      throw new Error(`LLM analysis failed: ${errMsg}`);
+    }
+
+    const candidates = Array.isArray(result.candidates) ? (result.candidates as Json[]) : [];
+    const first = candidates[0] || {};
+    const content = (first.content || {}) as Json;
+    const parts = Array.isArray(content.parts) ? (content.parts as Json[]) : [];
+    const cvText = parts.map((p) => String(p.text || "").trim()).filter(Boolean).join("\n").trim();
+
+    // Bill for CV analysis
+    await recordBilling(env, {
+      provider: "streetview-cv-analysis",
+      cacheHit: 0,
+      estimatedUsd: PRICES.geminiGenerate,
+      actualUsd: PRICES.geminiGenerate,
+      userId: clerkUser.userId,
+    });
+
+    const label = generateLinkLabel(heading, description, cvText);
+
+    return json({
+      ok: true,
+      panoId,
+      heading,
+      description,
+      cvAnalysis: cvText,
+      label,
+      estimatedUsd: PRICES.geminiGenerate,
+    });
+  } catch (err) {
+    throw new Error(`Link analysis error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function handleGetMapsKey(request: Request, env: Env): Promise<Response> {
+  // Return Google Maps API key for frontend use only (restricted to JS API)
+  const apiKey = requireGoogleMapsKey(env);
+  return json({
+    ok: true,
+    apiKey,
+  });
+}
+
+function extractProviderFromCopyright(copyright: string | null): string | null {
+  if (!copyright) return null;
+  const lower = copyright.toLowerCase();
+  if (lower.includes("jreast") || lower.includes("jr east")) return "JR East";
+  if (lower.includes("tokyo metro") || lower.includes("tokyometro")) return "Tokyo Metro";
+  if (lower.includes("metro")) return "Metro";
+  if (lower.includes("mtr") || lower.includes("hong kong")) return "MTR";
+  return null;
+}
+
+function generateLinkLabel(heading: number, description: string, cvText: string): string {
+  const dir = bearingToRelativeDir(heading);
+  const featureFromCV = extractFeatureFromCV(cvText);
+  const feature = featureFromCV || normalizeDescription(description);
+  return `${dir}${feature ? ` ${feature}` : ""}`;
+}
+
+function bearingToRelativeDir(bearing: number): string {
+  const normalized = ((bearing % 360) + 360) % 360;
+  const dirs = ["前方", "右前方", "右方", "右後方", "後方", "左後方", "左方", "左前方"];
+  const idx = Math.round(normalized / 45) % 8;
+  return dirs[idx];
+}
+
+function extractFeatureFromCV(cvText: string): string | null {
+  const text = cvText.toLowerCase();
+  if (text.includes("剪票口") || text.includes("ticket") || text.includes("gate")) return "剪票口";
+  if (text.includes("楼梯") || text.includes("stair")) return "樓梯";
+  if (text.includes("电梯") || text.includes("elevator")) return "電梯";
+  if (text.includes("扶梯") || text.includes("escalator")) return "扶梯";
+  if (text.includes("出口") || text.includes("exit")) return "出口";
+  if (text.includes("通道") || text.includes("corridor")) return "通道";
+  if (text.includes("平台") || text.includes("platform")) return "月台";
+  return null;
+}
+
+function normalizeDescription(desc: string): string {
+  const lower = desc.toLowerCase();
+  const map: Record<string, string> = {
+    staircase: "樓梯",
+    stair: "樓梯",
+    elevator: "電梯",
+    escalator: "扶梯",
+    corridor: "通道",
+    passage: "通道",
+    exit: "出口",
+    platform: "月台",
+    gate: "剪票口",
+    north: "北",
+    northeast: "東北",
+    east: "東",
+    southeast: "東南",
+    south: "南",
+    southwest: "西南",
+    west: "西",
+    northwest: "西北",
+  };
+  for (const [key, label] of Object.entries(map)) {
+    if (lower.includes(key)) {
+      return label;
+    }
+  }
+  return "";
+}
+
+function hasIndoorHintText(text: string): boolean {
+  const hints = ["station", "metro", "subway", "rail", "jr", "terminal", "mall", "airport", "indoor"];
+  return hints.some((hint) => text.includes(hint));
+}
+
+function hasStationHintText(text: string): boolean {
+  const hints = ["station", "tokyo", "jr", "rail", "metro", "subway", "platform", "yaesu", "marunouchi"];
+  return hints.some((hint) => text.includes(hint));
+}
+
+function offsetPointByMeters(origin: { lat: number; lon: number }, bearingDeg: number, meters: number): {
+  lat: number;
+  lon: number;
+} {
+  const R = 6_371_000;
+  const delta = meters / R;
+  const theta = (bearingDeg * Math.PI) / 180;
+  const phi1 = (origin.lat * Math.PI) / 180;
+  const lambda1 = (origin.lon * Math.PI) / 180;
+
+  const phi2 = Math.asin(Math.sin(phi1) * Math.cos(delta) + Math.cos(phi1) * Math.sin(delta) * Math.cos(theta));
+  const lambda2 =
+    lambda1 + Math.atan2(Math.sin(theta) * Math.sin(delta) * Math.cos(phi1), Math.cos(delta) - Math.sin(phi1) * Math.sin(phi2));
+
+  return {
+    lat: (phi2 * 180) / Math.PI,
+    lon: (lambda2 * 180) / Math.PI,
+  };
 }
 
 async function handleClerkWebhook(request: Request, env: Env): Promise<Response> {
@@ -4269,6 +5029,19 @@ function stableStringify(value: unknown): string {
   return `{${parts.join(",")}}`;
 }
 
+// Build query variants for better CJK / multilingual geocoding.
+// Tries: original, then replaces traditional-Chinese station characters
+// with their Japanese/simplified equivalents so Nominatim can find them.
+function buildQueryVariants(query: string): string[] {
+  const variants: string[] = [query];
+  // 驛 (traditional Chinese) ↔ 駅 (Japanese)
+  const v1 = query.replace(/\u9A5B/g, "\u99C5").replace(/\u7AD9/g, "\u99C5");
+  if (v1 !== query) variants.push(v1);
+  const v2 = query.replace(/\u99C5/g, "\u9A5B");
+  if (v2 !== query && !variants.includes(v2)) variants.push(v2);
+  return variants;
+}
+
 function nowEpoch(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -4297,7 +5070,11 @@ function headingLabel(heading: number): string {
 }
 
 function normalizeRoadName(name: string): string {
-  return name.toLowerCase().replace(/\s+/g, "").trim();
+  return name.toLowerCase().replace(/\s+/g, "").trim()
+    // Normalize traditional Chinese / variant CJK station characters to Japanese equivalents
+    // so queries like 東京驛 match OSM names using 東京駅
+    .replace(/\u9A5B/g, "\u99C5")  // 驛 → 駅
+    .replace(/\u7AD9/g, "\u99C5"); // 站 → 駅 (Chinese station char)
 }
 
 type BBox = { south: number; west: number; north: number; east: number };
@@ -4329,16 +5106,40 @@ function parseOverpassData(overpass: Json): ParsedOverpass {
     const type = String(el.type || "");
     if (type === "node") {
       const id = Number(el.id);
-      nodes.set(id, {
-        id,
-        lat: Number(el.lat),
-        lon: Number(el.lon),
-        tags: (el.tags || {}) as Json,
-      });
+      const lat = Number(el.lat);
+      const lon = Number(el.lon);
+      const tags = (el.tags || {}) as Json;
+      const existing = nodes.get(id);
+      if (!existing) {
+        nodes.set(id, { id, lat, lon, tags });
+      } else {
+        // Merge: keep valid coords and non-empty tags from either entry
+        nodes.set(id, {
+          id,
+          lat: !isNaN(lat) ? lat : existing.lat,
+          lon: !isNaN(lon) ? lon : existing.lon,
+          tags: Object.keys(tags).length > 0 ? tags : existing.tags,
+        });
+      }
     } else if (type === "way") {
+      const wayNodes = Array.isArray(el.nodes) ? (el.nodes as number[]) : [];
+      // Handle embedded geometry from 'out body geom' format
+      const wayGeometry = Array.isArray(el.geometry) ? (el.geometry as Json[]) : [];
+      if (wayGeometry.length > 0) {
+        wayNodes.forEach((nodeId, idx) => {
+          if (idx < wayGeometry.length) {
+            const geomNode = wayGeometry[idx];
+            const lat = Number(geomNode.lat);
+            const lon = Number(geomNode.lon);
+            if (!nodes.has(nodeId) && !isNaN(lat) && !isNaN(lon)) {
+              nodes.set(nodeId, { id: nodeId, lat, lon, tags: {} as Json });
+            }
+          }
+        });
+      }
       ways.push({
         id: Number(el.id),
-        nodes: Array.isArray(el.nodes) ? (el.nodes as number[]) : [],
+        nodes: wayNodes,
         tags: (el.tags || {}) as Json,
       });
     }
@@ -4650,3 +5451,13 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   const x = Math.sin(dPhi / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dLambda / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
+
+  function calculateBearing(startLat: number, startLon: number, endLat: number, endLon: number): number {
+    const dLon = ((endLon - startLon) * Math.PI) / 180;
+    const lat1 = (startLat * Math.PI) / 180;
+    const lat2 = (endLat * Math.PI) / 180;
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    const bearing = (Math.atan2(y, x) * 180) / Math.PI;
+    return ((bearing + 360) % 360);
+  }

@@ -248,6 +248,64 @@ button[disabled] {
   line-height: 1.6;
 }
 
+.street-section {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #d3dbd3;
+}
+
+.street-summary {
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+}
+
+.street-pano-viewer {
+  border: 1px solid #cad5ca;
+  border-radius: 10px;
+  padding: 8px;
+  background: #f9fcf8;
+}
+
+.street-pano-image {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid #c8d4c8;
+  display: block;
+}
+
+.street-scene-buttons {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.street-scene-btn {
+  padding: 6px 8px;
+  font-size: 0.92rem;
+}
+
+.street-scene-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.street-pano-caption {
+  margin-top: 8px;
+  line-height: 1.5;
+}
+
+.street-pano-caption + .street-pano-caption {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed #c8d4c8;
+}
+
+.street-advance-label {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
 @media (max-width: 680px) {
   .topbar {
     flex-direction: column;
@@ -258,6 +316,10 @@ button[disabled] {
   }
 
   .quick-nav-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .street-scene-buttons {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
