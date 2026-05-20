@@ -79,7 +79,12 @@ AlaVia/
 ├── src/
 │   ├── worker.ts                # Main backend: routes, API handlers, caching
 │   ├── config/constants.ts      # Shared constants and pricing
-│   └── lib/geo-utils.ts         # Shared geo/heading/math helpers
+│   ├── lib/geo-utils.ts         # Shared geo/heading/math helpers
+│   └── services/
+│       ├── cache.ts             # Cache lifecycle + billing helper
+│       ├── gateway-policy.ts    # Access control + rate limiting policy
+│       ├── schema.ts            # D1 schema bootstrap and indexes
+│       └── tiles.ts             # SoundScape tile pipeline orchestration
 ├── public/
 │   ├── app.js              # Frontend: UI, i18n, user interactions
 │   ├── index.html          # HTML structure

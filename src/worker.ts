@@ -1,5 +1,3 @@
-import { neon } from "@neondatabase/serverless";
-import { PMTiles, type RangeResponse, type Source } from "pmtiles";
 import {
   BUILTIN_ADMIN_EMAILS,
   CACHE_MAX_AGE_SECONDS,
@@ -20,10 +18,6 @@ import {
   RATE_LIMIT_DEFAULT_PER_WINDOW,
   RATE_LIMIT_PAID_PER_WINDOW,
   RATE_LIMIT_WINDOW_SECONDS,
-  SOUNDSCAPE_HK_PMTILES_KEY,
-  SOUNDSCAPE_TILE_MAX_AGE_SECONDS,
-  TILE_HOT_CACHE_THRESHOLD,
-  TILE_HOT_CACHE_TTL_SECONDS,
   TTL_365_DAYS,
   WEBHOOK_MAX_SKEW_SECONDS,
 } from "./config/constants";
@@ -41,6 +35,13 @@ import {
   sampleLineByMeters,
   signedBearingDelta,
 } from "./lib/geo-utils";
+import { buildCacheKey, getOrCreateCached, recordBilling } from "./services/cache";
+import {
+  enforceGatewayPolicies as applyGatewayPolicies,
+  enforceRateLimit as applyRateLimit,
+} from "./services/gateway-policy";
+import { ensureD1Schema } from "./services/schema";
+import { handleTilesRequest as handleTilesRequestFromService } from "./services/tiles";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -133,15 +134,6 @@ type GoogleRoutePlaceCandidate = {
   distanceToLineMeters: number;
 };
 
-type SoundscapeTileFeature = {
-  type: string;
-  osm_ids: number[];
-  feature_type: string | null;
-  feature_value: string | null;
-  geometry: unknown;
-  properties: Record<string, unknown> | null;
-};
-
 // ── Indoor Navigation Types ────────────────────────────────────────────────
 type StreetViewLink = {
   panoId: string;
@@ -195,7 +187,7 @@ export default {
 
     if (url.pathname.startsWith("/api/") && url.pathname !== "/api/clerk/webhook") {
       try {
-        await enforceGatewayPolicies(request, env, url.pathname);
+        await applyGatewayPolicies(request, env, url.pathname, () => ensureD1Schema(env));
       } catch (err) {
         return withErrorHandling(async () => {
           throw err;
@@ -304,7 +296,10 @@ export default {
       const zoom = parseInt(tilesMatch[1], 10);
       const x = parseInt(tilesMatch[2], 10);
       const y = parseInt(tilesMatch[3], 10);
-      return withErrorHandling(() => handleTilesRequest(request, env, ctx, zoom, x, y));
+      return withErrorHandling(() => handleTilesRequestFromService(request, env, ctx, zoom, x, y, {
+        ensureSchema: ensureD1Schema,
+        generateOsmTileData,
+      }));
     }
 
     return env.ASSETS.fetch(request);
@@ -2392,101 +2387,6 @@ async function withErrorHandling(fn: () => Promise<Response>): Promise<Response>
   }
 }
 
-async function enforceGatewayPolicies(request: Request, env: Env, path: string): Promise<void> {
-  const requireAccessIdentity =
-    path.startsWith("/api/paid/") ||
-    path.startsWith("/api/google/") ||
-    path.startsWith("/api/admin/") ||
-    path.startsWith("/api/me") ||
-    path.startsWith("/api/billing/");
-
-  if (requireAccessIdentity) {
-    enforceAllowedAccessEmails(request, env);
-  }
-  const pathGroup =
-    path.startsWith("/api/paid/") || path.startsWith("/api/google/") ? "paid" : "default";
-  const perWindow = pathGroup === "paid" ? RATE_LIMIT_PAID_PER_WINDOW : RATE_LIMIT_DEFAULT_PER_WINDOW;
-  await enforceRateLimit(request, env, `ip:${pathGroup}`, perWindow, RATE_LIMIT_WINDOW_SECONDS);
-}
-
-function enforceAllowedAccessEmails(request: Request, env: Env): void {
-  const host = new URL(request.url).hostname.toLowerCase();
-  if (host === "127.0.0.1" || host === "localhost") {
-    return;
-  }
-
-  const allowed = String(env.ALLOWED_ACCESS_EMAILS || "")
-    .split(",")
-    .map((v) => v.trim().toLowerCase())
-    .filter(Boolean);
-
-  if (allowed.length === 0) {
-    return;
-  }
-
-  const email = String(request.headers.get("cf-access-authenticated-user-email") || "")
-    .trim()
-    .toLowerCase();
-
-  if (!email) {
-    throw new Error("Cloudflare Access authentication required");
-  }
-  if (!allowed.includes(email)) {
-    throw new Error("Access denied for this email");
-  }
-}
-
-async function enforceRateLimit(
-  request: Request,
-  env: Env,
-  scope: string,
-  limit: number,
-  windowSeconds: number,
-): Promise<void> {
-  const ip = getClientIp(request);
-  if (!ip) {
-    return;
-  }
-
-  await ensureD1Schema(env);
-  const now = nowEpoch();
-  const bucket = Math.floor(now / windowSeconds);
-  const expiresAt = (bucket + 1) * windowSeconds + windowSeconds;
-  const key = `${scope}:${ip}:${bucket}`;
-
-  const row = await env.DB.prepare(
-    `INSERT INTO rate_limits (rate_key, count, expires_at, updated_at)
-     VALUES (?1, 1, ?2, ?3)
-     ON CONFLICT(rate_key) DO UPDATE SET
-       count = count + 1,
-       updated_at = excluded.updated_at
-     RETURNING count`,
-  )
-    .bind(key, expiresAt, now)
-    .first<{ count: number }>();
-
-  const count = Number(row?.count || 0);
-  if (count > limit) {
-    throw new Error("Too many requests");
-  }
-
-  if (Math.random() < 0.02) {
-    await env.DB.prepare("DELETE FROM rate_limits WHERE expires_at < ?1").bind(now).run();
-  }
-}
-
-function getClientIp(request: Request): string {
-  const direct = String(request.headers.get("cf-connecting-ip") || "").trim();
-  if (direct) {
-    return direct;
-  }
-  const forwarded = String(request.headers.get("x-forwarded-for") || "").trim();
-  if (!forwarded) {
-    return "";
-  }
-  return forwarded.split(",")[0]?.trim() || "";
-}
-
 function getEdgeCache(): Cache {
   return (caches as CacheStorage & { default: Cache }).default;
 }
@@ -2674,7 +2574,7 @@ async function requireClerkAuth(
   if (expectedAud && !audienceMatches(verified.payload.aud, expectedAud)) {
     throw new Error("Invalid or expired session");
   }
-  await enforceRateLimit(request, env, `user-auth:${verified.userId}`, RATE_LIMIT_DEFAULT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS);
+  await applyRateLimit(request, env, `user-auth:${verified.userId}`, RATE_LIMIT_DEFAULT_PER_WINDOW, RATE_LIMIT_WINDOW_SECONDS);
   const meta = await getClerkUserMeta(verified.userId, secretKey);
   if (!meta.approved) {
     throw new Error("Your account is pending approval");
@@ -3905,124 +3805,6 @@ function extractGoogleErrorMessage(payload: Json): string {
 }
 
 
-async function getOrCreateCached(
-  env: Env,
-  provider: string,
-  payload: Json,
-  creator: () => Promise<Json>,
-  ttlSeconds: number,
-  options?: {
-    ctx?: ExecutionContext;
-    staleWhileRevalidateSeconds?: number;
-  },
-): Promise<{ data: Json; cacheHit: boolean; stale?: boolean }> {
-  const cacheKey = await buildCacheKey(provider, payload);
-
-  const edgeReq = new Request(`https://cache.local/${provider}/${cacheKey}`);
-  const edgeHit = await getEdgeCache().match(edgeReq);
-  if (edgeHit) {
-    const data = (await edgeHit.json()) as Json;
-    return { data, cacheHit: true };
-  }
-
-  const now = nowEpoch();
-  const staleWhileRevalidateSeconds = Math.max(0, Number(options?.staleWhileRevalidateSeconds || 0));
-  const row = await env.DB.prepare(
-    "SELECT object_key, expires_at FROM api_cache WHERE cache_key = ?1 AND provider = ?2 LIMIT 1",
-  )
-    .bind(cacheKey, provider)
-    .first<{ object_key: string; expires_at: number }>();
-
-  if (row) {
-    const obj = await env.CACHE_BUCKET.get(row.object_key);
-    if (obj) {
-      const data = (await obj.json()) as Json;
-      await env.DB.prepare("UPDATE api_cache SET last_access_at = ?1 WHERE cache_key = ?2").bind(now, cacheKey).run();
-      await writeEdgeCache(edgeReq, data);
-
-      if (row.expires_at > now) {
-        return { data, cacheHit: true };
-      }
-
-      const staleFor = now - row.expires_at;
-      if (staleFor <= staleWhileRevalidateSeconds) {
-        if (options?.ctx) {
-          options.ctx.waitUntil(
-            (async () => {
-              const fresh = await creator();
-              await persistCachedValue(env, provider, cacheKey, payload, fresh, nowEpoch() + ttlSeconds, nowEpoch());
-              await writeEdgeCache(edgeReq, fresh);
-            })(),
-          );
-        }
-        return { data, cacheHit: true, stale: true };
-      }
-    }
-  }
-
-  const data = await creator();
-  await persistCachedValue(env, provider, cacheKey, payload, data, now + ttlSeconds, now);
-
-  await writeEdgeCache(edgeReq, data);
-
-  return { data, cacheHit: false };
-}
-
-async function persistCachedValue(
-  env: Env,
-  provider: string,
-  cacheKey: string,
-  payload: Json,
-  data: Json,
-  expiresAt: number,
-  now: number,
-): Promise<void> {
-  const objectKey = `${provider}/${cacheKey}.json`;
-  const cacheMeta = stableStringify(payload);
-
-  await env.CACHE_BUCKET.put(objectKey, JSON.stringify(data), {
-    httpMetadata: {
-      contentType: "application/json; charset=utf-8",
-      cacheControl: `max-age=${CACHE_MAX_AGE_SECONDS}`,
-    },
-  });
-
-  await env.DB.prepare(
-    `INSERT INTO api_cache (cache_key, provider, object_key, expires_at, created_at, last_access_at, cache_meta)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
-     ON CONFLICT(cache_key) DO UPDATE SET
-       provider = excluded.provider,
-       object_key = excluded.object_key,
-       expires_at = excluded.expires_at,
-       last_access_at = excluded.last_access_at,
-       cache_meta = excluded.cache_meta`,
-  )
-    .bind(cacheKey, provider, objectKey, expiresAt, now, cacheMeta)
-    .run();
-}
-
-async function writeEdgeCache(req: Request, data: Json): Promise<void> {
-  const res = new Response(JSON.stringify(data), {
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": `public, max-age=${CACHE_MAX_AGE_SECONDS}`,
-    },
-  });
-  await getEdgeCache().put(req, res);
-}
-
-async function recordBilling(
-  env: Env,
-  args: { provider: string; cacheHit: number; estimatedUsd: number; actualUsd: number; userId?: string },
-): Promise<void> {
-  const userId = args.userId || "anonymous";
-  await env.DB.prepare(
-    "INSERT INTO billing_events (user_id, provider, cache_hit, estimated_usd, actual_usd, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-  )
-    .bind(userId, args.provider, args.cacheHit, args.estimatedUsd, args.actualUsd, nowEpoch())
-    .run();
-}
-
 // ── New API handlers ───────────────────────────────────────────────────────
 async function handleMe(request: Request, env: Env): Promise<Response> {
   const secretKey = env.CLERK_SECRET_KEY || "";
@@ -4858,285 +4640,6 @@ async function verifySvixWebhook(headers: Headers, body: string, secret: string)
   return received.some((sig) => constantTimeEqual(sig, expected));
 }
 
-// ── SoundScape Tiles Handler (PMTiles + Neon PostGIS) ──────────────────
-/**
- * Handles tile requests at /tiles/{zoom}/{x}/{y}.json
- * 
- * Strategy:
- * 1. Hong Kong (zoom 16): Try R2 PMTiles first (pre-generated)
- * 2. Other regions (zoom 16): Query Neon PostGIS on-demand + cache to R2
- * 3. Other zooms: Not supported currently (return 404)
- * 
- * Each tile response is GeoJSON FeatureCollection compatible with SoundScape iOS app.
- */
-async function handleTilesRequest(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-  zoom: number,
-  x: number,
-  y: number,
-): Promise<Response> {
-  if (zoom !== 16) {
-    return json({ error: `Zoom ${zoom} not supported` }, 404);
-  }
-  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0) {
-    return json({ error: "Invalid tile coordinates" }, 400);
-  }
-
-  const cachedTile = await fetchCachedTileFromR2(env, zoom, x, y);
-  if (cachedTile) {
-    if (hasTileFeatures(cachedTile.tile)) {
-      return buildSoundscapeTileResponse(request, cachedTile.tile, "r2-hot-cache", SOUNDSCAPE_TILE_MAX_AGE_SECONDS, cachedTile.etag);
-    }
-  }
-
-  const pmtilesTile = await fetchPMTilesFromR2(env, zoom, x, y);
-  if (pmtilesTile) {
-    if (hasTileFeatures(pmtilesTile)) {
-      return buildSoundscapeTileResponse(request, pmtilesTile, "r2-pmtiles", SOUNDSCAPE_TILE_MAX_AGE_SECONDS);
-    }
-  }
-
-  try {
-    const tile = await fetchTileFromNeon(env, zoom, x, y);
-    if (tile && hasTileFeatures(tile)) {
-      ctx.waitUntil(recordTileAccessAndMaybeCache(env, zoom, x, y, tile));
-      return buildSoundscapeTileResponse(request, tile, "neon-postgis", 300);
-    }
-  } catch (err) {
-    console.error(`Neon PostGIS fetch failed for tile ${zoom}/${x}/${y}:`, err);
-  }
-
-  // Fallback for regions not covered by PMTiles/Neon: generate SoundScape-compatible
-  // tile content directly from live OSM data so app callouts still receive entities.
-  try {
-    const fallbackTile = await generateOsmSoundscapeTile(zoom, x, y);
-    if (hasTileFeatures(fallbackTile)) {
-      ctx.waitUntil(recordTileAccessAndMaybeCache(env, zoom, x, y, fallbackTile));
-      return buildSoundscapeTileResponse(request, fallbackTile, "overpass-fallback", 1800);
-    }
-  } catch (err) {
-    console.error(`Overpass fallback failed for tile ${zoom}/${x}/${y}:`, err);
-  }
-
-  const emptyTile = {
-    type: 'FeatureCollection',
-    features: [],
-    warning: 'No tile data available for this region'
-  } as Json;
-  return buildSoundscapeTileResponse(request, emptyTile, "empty", 120);
-}
-
-class R2PMTilesSource implements Source {
-  constructor(private readonly bucket: R2Bucket, private readonly key: string) {}
-
-  getKey(): string {
-    return `r2://${this.key}`;
-  }
-
-  async getBytes(offset: number, length: number, _signal?: AbortSignal, etag?: string): Promise<RangeResponse> {
-    const object = await this.bucket.get(this.key, {
-      onlyIf: etag ? { etagMatches: etag } : undefined,
-      range: { offset, length },
-    });
-    if (!object) {
-      throw new Error(`PMTiles archive not found: ${this.key}`);
-    }
-
-    const data = await object.arrayBuffer();
-    return {
-      data,
-      etag: object.httpEtag,
-      cacheControl: object.httpMetadata?.cacheControl,
-      expires: object.httpMetadata?.cacheExpiry?.toUTCString(),
-    };
-  }
-}
-
-const pmtilesArchiveCache = new Map<string, PMTiles>();
-
-function getPMTilesArchive(env: Env, key: string): PMTiles | null {
-  if (!env.TILES_BUCKET) {
-    return null;
-  }
-
-  const cached = pmtilesArchiveCache.get(key);
-  if (cached) {
-    return cached;
-  }
-
-  const archive = new PMTiles(new R2PMTilesSource(env.TILES_BUCKET, key));
-  pmtilesArchiveCache.set(key, archive);
-  return archive;
-}
-
-async function fetchCachedTileFromR2(env: Env, zoom: number, x: number, y: number): Promise<{ tile: Json; etag: string | null } | null> {
-  if (!env.TILES_BUCKET) {
-    return null;
-  }
-
-  const key = `tiles/${zoom}/${x}/${y}.json`;
-  const object = await env.TILES_BUCKET.get(key);
-  if (!object) {
-    return null;
-  }
-
-  return {
-    tile: (await object.json()) as Json,
-    etag: object.httpEtag ?? null,
-  };
-}
-
-async function fetchPMTilesFromR2(env: Env, zoom: number, x: number, y: number): Promise<Json | null> {
-  const archive = getPMTilesArchive(env, SOUNDSCAPE_HK_PMTILES_KEY);
-  if (!archive) {
-    return null;
-  }
-
-  try {
-    const tile = await archive.getZxy(zoom, x, y);
-    if (!tile) {
-      return null;
-    }
-
-    return parseTilePayload(tile.data);
-  } catch (err) {
-    console.error(`R2 PMTiles fetch error for tile ${zoom}/${x}/${y}:`, err);
-    return null;
-  }
-}
-
-function parseTilePayload(data: ArrayBuffer): Json {
-  const text = new TextDecoder().decode(new Uint8Array(data));
-  return JSON.parse(text) as Json;
-}
-
-async function fetchTileFromNeon(env: Env, zoom: number, x: number, y: number): Promise<Json | null> {
-  const dsn = String(env.NEON_DSN || "").trim();
-  if (!dsn) {
-    return null;
-  }
-
-  const sql = neon(dsn, { fetchOptions: { cache: "no-store" } });
-  const rows = await sql`
-    SELECT type, osm_ids, feature_type, feature_value, geometry, properties
-    FROM soundscape_tile(${zoom}, ${x}, ${y})
-  ` as SoundscapeTileFeature[];
-
-  const features = Array.isArray(rows)
-    ? rows.map((row) => ({
-        type: row.type || "Feature",
-        osm_ids: Array.isArray(row.osm_ids) ? row.osm_ids : [],
-        feature_type: row.feature_type || null,
-        feature_value: row.feature_value || null,
-        geometry: row.geometry,
-        properties: row.properties || {},
-      }))
-    : [];
-
-  return {
-    type: "FeatureCollection",
-    features,
-  } as Json;
-}
-
-async function recordTileAccessAndMaybeCache(env: Env, zoom: number, x: number, y: number, tile: Json): Promise<void> {
-  await ensureD1Schema(env);
-
-  const key = `${zoom}/${x}/${y}`;
-  const now = nowEpoch();
-  const row = await env.DB.prepare(
-    `INSERT INTO tile_access (tile_key, hits, first_seen_at, last_seen_at, cached_at)
-     VALUES (?1, 1, ?2, ?2, NULL)
-     ON CONFLICT(tile_key) DO UPDATE SET
-       hits = hits + 1,
-       last_seen_at = excluded.last_seen_at
-     RETURNING hits, cached_at`,
-  ).bind(key, now).first<{ hits: number; cached_at: number | null }>();
-
-  const hits = Number(row?.hits || 0);
-  const cachedAt = row?.cached_at ?? null;
-  if (cachedAt || hits < TILE_HOT_CACHE_THRESHOLD) {
-    return;
-  }
-
-  await cacheHotTileToR2(env, zoom, x, y, tile);
-  await env.DB.prepare(
-    "UPDATE tile_access SET cached_at = ?2 WHERE tile_key = ?1",
-  ).bind(key, now).run();
-}
-
-async function cacheHotTileToR2(env: Env, zoom: number, x: number, y: number, tile: Json): Promise<void> {
-  if (!env.TILES_BUCKET) {
-    return;
-  }
-
-  const key = `tiles/${zoom}/${x}/${y}.json`;
-  await env.TILES_BUCKET.put(key, JSON.stringify(tile), {
-    httpMetadata: {
-      contentType: "application/json",
-      cacheControl: `public, max-age=${TILE_HOT_CACHE_TTL_SECONDS}`,
-    },
-  });
-}
-
-async function generateTileETag(tile: Json): Promise<string> {
-  const hash = await buildCacheKey("soundscape-tile-etag-v1", tile);
-  return `"${hash}"`;
-}
-
-function hasTileFeatures(tile: Json): boolean {
-  const features = Array.isArray(tile.features) ? (tile.features as unknown[]) : [];
-  return features.length > 0;
-}
-
-async function generateOsmSoundscapeTile(zoom: number, x: number, y: number): Promise<Json> {
-  const tile = await generateOsmTileData(zoom, x, y);
-  const features = Array.isArray(tile.features) ? (tile.features as Json[]) : [];
-
-  const normalized = features.map((feature) => ({
-    type: String(feature.type || "Feature"),
-    osm_ids: Array.isArray(feature.osm_ids) ? feature.osm_ids : [],
-    feature_type: feature.feature_type ?? null,
-    feature_value: feature.feature_value ?? null,
-    geometry: feature.geometry ?? null,
-    properties: (feature.properties as Json) || {},
-  }));
-
-  return {
-    type: "FeatureCollection",
-    features: normalized,
-  } as Json;
-}
-
-async function buildSoundscapeTileResponse(request: Request, tile: Json, source: string, maxAgeSeconds: number, explicitEtag: string | null = null): Promise<Response> {
-  const etag = explicitEtag || await generateTileETag(tile);
-  const ifNoneMatch = String(request.headers.get("if-none-match") || "").trim();
-
-  if (ifNoneMatch && ifNoneMatch === etag) {
-    return new Response(null, {
-      status: 304,
-      headers: {
-        "Cache-Control": `public, max-age=${maxAgeSeconds}, stale-while-revalidate=${DAY}`,
-        "ETag": etag,
-        "Access-Control-Allow-Origin": "*",
-        "X-Tile-Source": source,
-      },
-    });
-  }
-
-  return new Response(JSON.stringify(tile), {
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": `public, max-age=${maxAgeSeconds}, stale-while-revalidate=${DAY}`,
-      "ETag": etag,
-      "Access-Control-Allow-Origin": "*",
-      "X-Tile-Source": source,
-    },
-  });
-}
-
 function base64Decode(value: string): Uint8Array | null {
   try {
     const binary = atob(value);
@@ -5155,88 +4658,6 @@ function constantTimeEqual(a: string, b: string): boolean {
     out |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return out === 0;
-}
-
-async function ensureD1Schema(env: Env): Promise<void> {
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS api_cache (
-      cache_key TEXT PRIMARY KEY,
-      provider TEXT NOT NULL,
-      object_key TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      last_access_at INTEGER NOT NULL
-    )`,
-  ).run();
-
-  await env.DB.prepare(
-    "CREATE INDEX IF NOT EXISTS idx_api_cache_provider_expires ON api_cache(provider, expires_at)",
-  ).run();
-
-  try {
-    await env.DB.prepare("ALTER TABLE api_cache ADD COLUMN cache_meta TEXT").run();
-  } catch {
-    // Column already exists in most environments.
-  }
-
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS billing_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT,
-      provider TEXT NOT NULL,
-      cache_hit INTEGER NOT NULL,
-      estimated_usd REAL NOT NULL,
-      actual_usd REAL,
-      created_at INTEGER NOT NULL
-    )`,
-  ).run();
-
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS rate_limits (
-      rate_key TEXT PRIMARY KEY,
-      count INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    )`,
-  ).run();
-
-  await env.DB.prepare(
-    "CREATE INDEX IF NOT EXISTS idx_rate_limits_expires ON rate_limits(expires_at)",
-  ).run();
-
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS tile_access (
-      tile_key TEXT PRIMARY KEY,
-      hits INTEGER NOT NULL,
-      first_seen_at INTEGER NOT NULL,
-      last_seen_at INTEGER NOT NULL,
-      cached_at INTEGER
-    )`,
-  ).run();
-
-  await env.DB.prepare(
-    "CREATE INDEX IF NOT EXISTS idx_tile_access_cached_hits ON tile_access(cached_at, hits)",
-  ).run();
-}
-
-async function buildCacheKey(provider: string, payload: Json): Promise<string> {
-  const text = `${provider}:${stableStringify(payload)}`;
-  const encoded = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest("SHA-256", encoded);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((v) => stableStringify(v)).join(",")}]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  const parts = keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`);
-  return `{${parts.join(",")}}`;
 }
 
 type BBox = { south: number; west: number; north: number; east: number };

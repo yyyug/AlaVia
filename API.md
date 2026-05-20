@@ -35,6 +35,14 @@ This file is the single source of truth for AlaVia backend architecture, API con
   - Shared constants and price table
 - src/lib/geo-utils.ts
   - Coordinate, heading, distance, and normalization helpers
+- src/services/cache.ts
+  - Shared cache keying, edge/R2/D1 cache lifecycle, and billing write helper
+- src/services/gateway-policy.ts
+  - Access-policy enforcement and reusable rate-limit guard
+- src/services/schema.ts
+  - D1 schema bootstrap and index creation lifecycle
+- src/services/tiles.ts
+  - SoundScape tile pipeline (R2 hot cache -> PMTiles -> Neon -> Overpass fallback)
 
 This split intentionally keeps behavior unchanged while reducing worker.ts growth pressure.
 
@@ -159,8 +167,11 @@ All endpoints use JSON request/response unless noted.
   - src/handlers/osm.ts
   - src/handlers/streetview.ts
   - src/handlers/admin.ts
-- Move cache/storage services:
-  - src/services/cache.ts
-  - src/services/tile.ts
+
+Completed service extractions in this phase:
+- src/services/cache.ts
+- src/services/gateway-policy.ts
+- src/services/schema.ts
+- src/services/tiles.ts
 
 These should be done incrementally with snapshot commits and build checks each step.
