@@ -40,6 +40,7 @@ import {
   enforceGatewayPolicies as applyGatewayPolicies,
   enforceRateLimit as applyRateLimit,
 } from "./services/gateway-policy";
+import { dispatchRoute } from "./services/http-router";
 import { ensureD1Schema } from "./services/schema";
 import { handleTilesRequest as handleTilesRequestFromService } from "./services/tiles";
 
@@ -184,6 +185,7 @@ type IndoorStepDecision = {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const method = request.method;
 
     if (url.pathname.startsWith("/api/") && url.pathname !== "/api/clerk/webhook") {
       try {
@@ -195,104 +197,47 @@ export default {
       }
     }
 
-    if (url.pathname === "/api/geocode/autobbox" && request.method === "POST") {
-      return withErrorHandling(() => handleGeocodeAutoBbox(request));
-    }
-    if (url.pathname === "/api/geocode/reverse-road" && request.method === "POST") {
-      return withErrorHandling(() => handleGeocodeReverseRoad(request, env, ctx));
-    }
-    if (url.pathname === "/api/overpass/segment" && request.method === "POST") {
-      return withErrorHandling(() => handleOverpassSegment(request, env, ctx));
-    }
-    if (url.pathname === "/api/intersections/near" && request.method === "POST") {
-      return withErrorHandling(() => handleIntersectionsNear(request, env, ctx));
-    }
-    if (url.pathname === "/api/osm/tile" && request.method === "POST") {
-      return withErrorHandling(() => handleOsmTile(request, env, ctx));
-    }
-    if (url.pathname === "/api/osm/scan-nearby" && request.method === "POST") {
-      return withErrorHandling(() => handleOsmScanNearby(request, env, ctx));
-    }
-    if (url.pathname === "/api/osm/places-around" && request.method === "POST") {
-      return withErrorHandling(() => handleOsmPlacesAround(request, env, ctx));
-    }
-    if (url.pathname === "/api/paid/places" && request.method === "POST") {
-      return withErrorHandling(() => handlePaidPlaces(request, env, ctx));
-    }
+    const routed = await dispatchRoute(url.pathname, method, [
+      { pathname: "/api/geocode/autobbox", method: "POST", handler: () => withErrorHandling(() => handleGeocodeAutoBbox(request)) },
+      { pathname: "/api/geocode/reverse-road", method: "POST", handler: () => withErrorHandling(() => handleGeocodeReverseRoad(request, env, ctx)) },
+      { pathname: "/api/overpass/segment", method: "POST", handler: () => withErrorHandling(() => handleOverpassSegment(request, env, ctx)) },
+      { pathname: "/api/intersections/near", method: "POST", handler: () => withErrorHandling(() => handleIntersectionsNear(request, env, ctx)) },
+      { pathname: "/api/osm/tile", method: "POST", handler: () => withErrorHandling(() => handleOsmTile(request, env, ctx)) },
+      { pathname: "/api/osm/scan-nearby", method: "POST", handler: () => withErrorHandling(() => handleOsmScanNearby(request, env, ctx)) },
+      { pathname: "/api/osm/places-around", method: "POST", handler: () => withErrorHandling(() => handleOsmPlacesAround(request, env, ctx)) },
+      { pathname: "/api/paid/places", method: "POST", handler: () => withErrorHandling(() => handlePaidPlaces(request, env, ctx)) },
+      { pathname: "/api/paid/streetview", method: "POST", handler: () => withErrorHandling(() => handlePaidStreetView(request, env, ctx)) },
+      { pathname: "/api/paid/streetview/panorama-describe", method: "POST", handler: () => withErrorHandling(() => handlePaidStreetViewPanoramaDescribe(request, env)) },
+      { pathname: "/api/streetview/metadata", method: "POST", handler: () => withErrorHandling(() => handleStreetViewMetadata(request, env)) },
+      { pathname: "/api/streetview/resolve-pano", method: "POST", handler: () => withErrorHandling(() => handleResolveStreetViewPano(request, env)) },
+      { pathname: "/api/streetview/find-indoor-entry", method: "POST", handler: () => withErrorHandling(() => handleFindNearbyIndoorEntry(request, env, ctx)) },
+      { pathname: "/api/streetview/indoor-step", method: "POST", handler: () => withErrorHandling(() => handleIndoorStepDecision(request)) },
+      { pathname: "/api/streetview/analyze-link", method: "POST", handler: () => withErrorHandling(() => handleAnalyzeStreetViewLink(request, env, ctx)) },
+      { pathname: "/api/config/maps-key", method: "POST", handler: () => withErrorHandling(() => handleGetMapsKey(request, env)) },
+      { pathname: "/api/admin/cleanup-noimage", method: "POST", handler: () => withErrorHandling(() => handleCleanupNoImage(request, env)) },
+      { pathname: "/api/admin/streetview-storage", method: "POST", handler: () => withErrorHandling(() => handleStreetViewStorageReport(request, env)) },
+      { pathname: "/api/paid/route-scenery", method: "POST", handler: () => withErrorHandling(() => handlePaidRouteScenery(request, env, ctx)) },
+      { pathname: "/api/osm/route-places", method: "POST", handler: () => withErrorHandling(() => handleOsmRoutePlaces(request, env, ctx)) },
+      { pathname: "/api/google/route-places", method: "POST", handler: () => withErrorHandling(() => handleGoogleRoutePlaces(request, env, ctx)) },
+      { pathname: "/api/intersections/address-batch", method: "POST", handler: () => withErrorHandling(() => handleIntersectionAddressBatch(request, env, ctx)) },
+      { pathname: "/api/me", method: "GET", handler: () => withErrorHandling(() => handleMe(request, env)) },
+      { pathname: "/api/billing/summary", method: "GET", handler: () => withErrorHandling(() => handleBillingSummary(request, env)) },
+      { pathname: "/api/admin/users", method: "GET", handler: () => withErrorHandling(() => handleAdminListUsers(request, env)) },
+      { pathname: "/api/admin/billing-summary", method: "GET", handler: () => withErrorHandling(() => handleAdminBillingSummary(request, env)) },
+      { pathname: "/api/admin/approve-user", method: "POST", handler: () => withErrorHandling(() => handleAdminApproveUser(request, env)) },
+      { pathname: "/api/admin/cache-stats", method: "GET", handler: () => withErrorHandling(() => handleAdminCacheStats(request, env)) },
+      { pathname: "/api/admin/cache-purge-expired", method: "POST", handler: () => withErrorHandling(() => handleAdminCachePurgeExpired(request, env)) },
+      { pathname: "/api/admin/cache-streets", method: "GET", handler: () => withErrorHandling(() => handleAdminCacheStreets(request, env)) },
+      { pathname: "/api/clerk/webhook", method: "POST", handler: () => withErrorHandling(() => handleClerkWebhook(request, env)) },
+    ]);
 
-    if (url.pathname === "/api/paid/streetview" && request.method === "POST") {
-      return withErrorHandling(() => handlePaidStreetView(request, env, ctx));
-    }
-    if (url.pathname === "/api/paid/streetview/panorama-describe" && request.method === "POST") {
-      return withErrorHandling(() => handlePaidStreetViewPanoramaDescribe(request, env));
-    }
-    if (url.pathname === "/api/streetview/metadata" && request.method === "POST") {
-      return withErrorHandling(() => handleStreetViewMetadata(request, env));
-    }
-    if (url.pathname === "/api/streetview/resolve-pano" && request.method === "POST") {
-      return withErrorHandling(() => handleResolveStreetViewPano(request, env));
-    }
-    if (url.pathname === "/api/streetview/find-indoor-entry" && request.method === "POST") {
-      return withErrorHandling(() => handleFindNearbyIndoorEntry(request, env, ctx));
-    }
-    if (url.pathname === "/api/streetview/indoor-step" && request.method === "POST") {
-      return withErrorHandling(() => handleIndoorStepDecision(request));
-    }
-    if (url.pathname === "/api/streetview/analyze-link" && request.method === "POST") {
-      return withErrorHandling(() => handleAnalyzeStreetViewLink(request, env, ctx));
-    }
-    if (url.pathname === "/api/config/maps-key" && request.method === "POST") {
-      return withErrorHandling(() => handleGetMapsKey(request, env));
-    }
-    if (url.pathname === "/api/admin/cleanup-noimage" && request.method === "POST") {
-      return withErrorHandling(() => handleCleanupNoImage(request, env));
-    }
-    if (url.pathname === "/api/admin/streetview-storage" && request.method === "POST") {
-      return withErrorHandling(() => handleStreetViewStorageReport(request, env));
-    }
-    if (url.pathname === "/api/paid/route-scenery" && request.method === "POST") {
-      return withErrorHandling(() => handlePaidRouteScenery(request, env, ctx));
-    }
-    if (url.pathname === "/api/osm/route-places" && request.method === "POST") {
-      return withErrorHandling(() => handleOsmRoutePlaces(request, env, ctx));
-    }
-    if (url.pathname === "/api/google/route-places" && request.method === "POST") {
-      return withErrorHandling(() => handleGoogleRoutePlaces(request, env, ctx));
-    }
-    if (url.pathname === "/api/intersections/address-batch" && request.method === "POST") {
-      return withErrorHandling(() => handleIntersectionAddressBatch(request, env, ctx));
-    }
-    if (url.pathname === "/api/me" && request.method === "GET") {
-      return withErrorHandling(() => handleMe(request, env));
-    }
-    if (url.pathname === "/api/billing/summary" && request.method === "GET") {
-      return withErrorHandling(() => handleBillingSummary(request, env));
-    }
-    if (url.pathname === "/api/admin/users" && request.method === "GET") {
-      return withErrorHandling(() => handleAdminListUsers(request, env));
-    }
-    if (url.pathname === "/api/admin/billing-summary" && request.method === "GET") {
-      return withErrorHandling(() => handleAdminBillingSummary(request, env));
-    }
-    if (url.pathname === "/api/admin/approve-user" && request.method === "POST") {
-      return withErrorHandling(() => handleAdminApproveUser(request, env));
-    }
-    if (url.pathname === "/api/admin/cache-stats" && request.method === "GET") {
-      return withErrorHandling(() => handleAdminCacheStats(request, env));
-    }
-    if (url.pathname === "/api/admin/cache-purge-expired" && request.method === "POST") {
-      return withErrorHandling(() => handleAdminCachePurgeExpired(request, env));
-    }
-    if (url.pathname === "/api/admin/cache-streets" && request.method === "GET") {
-      return withErrorHandling(() => handleAdminCacheStreets(request, env));
-    }
-    if (url.pathname === "/api/clerk/webhook" && request.method === "POST") {
-      return withErrorHandling(() => handleClerkWebhook(request, env));
+    if (routed) {
+      return routed;
     }
 
     // ── SoundScape Tiles Routes ──────────────────────────────────────────
     const tilesMatch = /^\/tiles\/(\d+)\/(\d+)\/(\d+)\.json$/.exec(url.pathname);
-    if (tilesMatch && request.method === "GET") {
+    if (tilesMatch && method === "GET") {
       const zoom = parseInt(tilesMatch[1], 10);
       const x = parseInt(tilesMatch[2], 10);
       const y = parseInt(tilesMatch[3], 10);
