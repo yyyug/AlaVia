@@ -9,6 +9,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$NpxCommand = "npx.cmd"
 
 function Import-DevVars {
   param([string]$Path)
@@ -33,7 +34,7 @@ function Invoke-WranglerJson {
     [string[]]$Arguments
   )
 
-  $output = & npx wrangler @Arguments 2>&1
+  $output = & $NpxCommand wrangler @Arguments 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw ($output -join [Environment]::NewLine)
   }
@@ -46,7 +47,7 @@ function Remove-R2ObjectByKey {
     [string]$ObjectKey
   )
 
-  & npx wrangler r2 object delete "$BucketName/$ObjectKey" --remote --env $Environment | Out-Null
+  & $NpxCommand wrangler r2 object delete "$BucketName/$ObjectKey" --remote --env $Environment | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to delete R2 object $ObjectKey"
   }
@@ -54,7 +55,7 @@ function Remove-R2ObjectByKey {
 }
 
 function Clear-D1CachedMarkers {
-  & npx wrangler d1 execute $DatabaseName --remote --env $Environment --yes --command "UPDATE tile_access SET cached_at = NULL WHERE cached_at IS NOT NULL" | Out-Null
+  & $NpxCommand wrangler d1 execute $DatabaseName --remote --env $Environment --yes --command "UPDATE tile_access SET cached_at = NULL WHERE cached_at IS NOT NULL" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Failed to clear D1 tile_access cached_at markers"
   }
