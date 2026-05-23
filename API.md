@@ -149,6 +149,13 @@ All endpoints use JSON request/response unless noted.
 - Re-warm HK tile hot cache after deploy:
   - npm run prefetch:hk -- --from 1 --to <n> --warmTiles true --warmTileRepeats 3
 
+### Neon soundscape_tile() function alignment
+
+- Canonical SQL is versioned at:
+  - sql/soundscape_tile.sql
+- Apply to Neon/PostGIS with:
+  - NEON_DSN="..." npm run neon:apply:soundscape-tile
+
 ### Fast smoke checks
 
 - Tile endpoint:
