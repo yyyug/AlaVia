@@ -7,7 +7,8 @@
     "build": "tsc --outDir dist --rootDir src",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "prefetch:hk": "node scripts/prefetch-hk-streets.mjs"
+    "prefetch:hk": "node scripts/prefetch-hk-streets.mjs",
+    "tiles:clear": "powershell -ExecutionPolicy Bypass -File scripts/clear-soundscape-tiles.ps1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260430.0",

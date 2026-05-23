@@ -11,6 +11,8 @@ const language = String(args.language || "zh-TW");
 const countryCode = "HK";
 const streetsFile = "scripts/hk-streets.json";
 const refreshStreetList = String(args.refreshStreetList || "false").toLowerCase() === "true";
+const warmTiles = String(args.warmTiles || "true").toLowerCase() === "true";
+const warmTileRepeats = Math.max(1, Number(args.warmTileRepeats || 3));
 
 if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from) {
   console.error("Invalid range. Use --from <start> --to <end>, e.g. --from 1 --to 300");
@@ -31,6 +33,8 @@ async function main() {
   let totalIntersections = 0;
   let totalSegments = 0;
   let streetsDone = 0;
+  let totalTilesWarmed = 0;
+  const warmedTiles = new Set();
 
   for (const item of selected) {
     console.log(`\n[${item.index}] ${item.name}`);
@@ -70,6 +74,17 @@ async function main() {
       const row = intersections[i];
       const next = intersections[i + 1] || null;
       const heading = Number.isFinite(row?.bearingToNext) ? Number(row.bearingToNext) : 0;
+
+      if (warmTiles) {
+        try {
+          const warmed = await warmSoundscapeTile(row.lat, row.lon, warmedTiles);
+          if (warmed) {
+            totalTilesWarmed += 1;
+          }
+        } catch (err) {
+          console.log(`    - tile warm failed at intersection ${i + 1}: ${err.message}`);
+        }
+      }
 
       // Check metadata first to avoid unnecessary API calls if no Street View coverage
       let metadataOk = false;
@@ -126,7 +141,42 @@ async function main() {
   console.log(`Streets completed: ${streetsDone}`);
   console.log(`Intersections covered: ${totalIntersections}`);
   console.log(`OSM route segments covered: ${totalSegments}`);
+  if (warmTiles) {
+    console.log(`Soundscape tiles warmed: ${totalTilesWarmed} unique tiles x ${warmTileRepeats} hit(s)`);
+  }
   console.log("All successful calls are cached into R2 by the worker.");
+}
+
+async function warmSoundscapeTile(lat, lon, warmedTiles) {
+  const tile = latLonToTile(lat, lon, 16);
+  const key = `${tile.z}/${tile.x}/${tile.y}`;
+  if (warmedTiles.has(key)) {
+    return false;
+  }
+
+  for (let attempt = 0; attempt < warmTileRepeats; attempt += 1) {
+    const res = await fetch(`${baseUrl}/tiles/${tile.z}/${tile.x}/${tile.y}.json`, {
+      headers: { accept: "application/json" },
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}${body ? ` ${body}` : ""}`);
+    }
+  }
+
+  warmedTiles.add(key);
+  return true;
+}
+
+function latLonToTile(lat, lon, zoom) {
+  const scale = 2 ** zoom;
+  const latRad = (lat * Math.PI) / 180;
+  return {
+    z: zoom,
+    x: Math.floor(((lon + 180) / 360) * scale),
+    y: Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * scale),
+  };
 }
 
 async function loadOrCreateIndexedStreetList() {

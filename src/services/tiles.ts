@@ -49,20 +49,29 @@ export async function handleTilesRequest(
   }
 
   const cachedTile = await fetchCachedTileFromR2(env, zoom, x, y);
-  if (cachedTile && hasTileFeatures(cachedTile.tile)) {
+  if (cachedTile && hasTileFeatures(cachedTile.tile) && hasCompatibleIntersectionLinks(cachedTile.tile)) {
     return buildSoundscapeTileResponse(request, cachedTile.tile, "r2-hot-cache", SOUNDSCAPE_TILE_MAX_AGE_SECONDS, cachedTile.etag);
+  }
+  if (cachedTile && hasTileFeatures(cachedTile.tile)) {
+    console.warn(`Skipping incompatible R2 hot-cache tile ${zoom}/${x}/${y}`);
   }
 
   const pmtilesTile = await fetchPMTilesFromR2(env, zoom, x, y);
-  if (pmtilesTile && hasTileFeatures(pmtilesTile)) {
+  if (pmtilesTile && hasTileFeatures(pmtilesTile) && hasCompatibleIntersectionLinks(pmtilesTile)) {
     return buildSoundscapeTileResponse(request, pmtilesTile, "r2-pmtiles", SOUNDSCAPE_TILE_MAX_AGE_SECONDS);
+  }
+  if (pmtilesTile && hasTileFeatures(pmtilesTile)) {
+    console.warn(`Skipping incompatible PMTiles tile ${zoom}/${x}/${y}`);
   }
 
   try {
     const tile = await fetchTileFromNeon(env, zoom, x, y);
-    if (tile && hasTileFeatures(tile)) {
+    if (tile && hasTileFeatures(tile) && hasCompatibleIntersectionLinks(tile)) {
       ctx.waitUntil(recordTileAccessAndMaybeCache(env, zoom, x, y, tile, deps.ensureSchema));
       return buildSoundscapeTileResponse(request, tile, "neon-postgis", 300);
+    }
+    if (tile && hasTileFeatures(tile)) {
+      console.warn(`Skipping incompatible Neon tile ${zoom}/${x}/${y}`);
     }
   } catch (err) {
     console.error(`Neon PostGIS fetch failed for tile ${zoom}/${x}/${y}:`, err);
@@ -254,6 +263,30 @@ async function generateTileETag(tile: Json): Promise<string> {
 function hasTileFeatures(tile: Json): boolean {
   const features = Array.isArray(tile.features) ? (tile.features as unknown[]) : [];
   return features.length > 0;
+}
+
+function hasCompatibleIntersectionLinks(tile: Json): boolean {
+  const features = Array.isArray(tile.features) ? (tile.features as Json[]) : [];
+  if (features.length === 0) {
+    return false;
+  }
+
+  const roadIds = new Set<number>(
+    features
+      .filter((feature) => feature.feature_type === "highway" && feature.feature_value !== "gd_intersection")
+      .flatMap((feature) => Array.isArray(feature.osm_ids) ? [Number(feature.osm_ids[0])] : [])
+      .filter((id) => Number.isFinite(id)),
+  );
+
+  const intersections = features.filter((feature) => feature.feature_value === "gd_intersection");
+  if (intersections.length === 0 || roadIds.size === 0) {
+    return true;
+  }
+
+  return intersections.some((feature) =>
+    Array.isArray(feature.osm_ids)
+      && feature.osm_ids.some((id) => roadIds.has(Number(id))),
+  );
 }
 
 async function generateOsmSoundscapeTile(

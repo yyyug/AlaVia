@@ -63,6 +63,12 @@ npm run prefetch:hk -- --from 1 --to 100 --refreshStreetList true
 
 # Custom base URL and language
 npm run prefetch:hk -- --from 1 --to 50 --baseUrl https://example.com --language en
+
+# Warm Soundscape tiles into hot cache (defaults to on, repeated 3 times per tile)
+npm run prefetch:hk -- --from 1 --to 50 --warmTiles true --warmTileRepeats 3
+
+# Clear old Soundscape tile cache objects before repopulating
+npm run tiles:clear
 ```
 
 **Parameters:**
@@ -71,6 +77,8 @@ npm run prefetch:hk -- --from 1 --to 50 --baseUrl https://example.com --language
 - `--language <code>` - Language for descriptions: `zh-TW`, `en`, `ja`, `ko` (default: `zh-TW`)
 - `--baseUrl <url>` - API base URL (default: env ALAVIA_BASE_URL or http://127.0.0.1:8787)
 - `--refreshStreetList` - Force refresh street index from Overpass (default: false)
+- `--warmTiles` - Warm `/tiles/16/x/y.json` for each discovered intersection (default: true)
+- `--warmTileRepeats` - Number of requests per unique tile to exceed hot-cache threshold (default: 3)
 
 ## 📦 Project Structure
 

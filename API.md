@@ -142,6 +142,13 @@ All endpoints use JSON request/response unless noted.
   - wrangler deploy --env=""
   - or wrangler deploy --env=<name>
 
+### SoundScape tile cache refresh
+
+- Clear old objects before repopulating when tile schema changes:
+  - npm run tiles:clear
+- Re-warm HK tile hot cache after deploy:
+  - npm run prefetch:hk -- --from 1 --to <n> --warmTiles true --warmTileRepeats 3
+
 ### Fast smoke checks
 
 - Tile endpoint:

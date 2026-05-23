@@ -1071,9 +1071,14 @@ function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
 
   // Calculate road intersections
   const nodeUsage = new Map<number, number>();
+  const nodeToWayIds = new Map<number, Set<number>>();
   for (const way of roadWays) {
     for (const nid of way.nodes) {
       nodeUsage.set(nid, (nodeUsage.get(nid) || 0) + 1);
+      if (!nodeToWayIds.has(nid)) {
+        nodeToWayIds.set(nid, new Set<number>());
+      }
+      nodeToWayIds.get(nid)!.add(way.id);
     }
   }
   for (const [nid, count] of nodeUsage) {
@@ -1087,9 +1092,13 @@ function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
     if (node.lat < bbox.south || node.lat > bbox.north || node.lon < bbox.west || node.lon > bbox.east) {
       continue;
     }
+    const wayIds = Array.from(nodeToWayIds.get(nid) ?? []).sort((a, b) => a - b);
+    if (wayIds.length <= 1) {
+      continue;
+    }
     features.push({
       type: "Feature",
-      osm_ids: [nid],
+      osm_ids: wayIds,
       feature_type: "highway",
       feature_value: "gd_intersection",
       geometry: { type: "Point", coordinates: [round6(node.lon), round6(node.lat)] },
