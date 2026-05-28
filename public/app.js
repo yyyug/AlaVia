@@ -483,6 +483,15 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
+function calculateBearing(lat1, lon1, lat2, lon2) {
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const dLambda = ((lon2 - lon1) * Math.PI) / 180;
+  const y = Math.sin(dLambda) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dLambda);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
 function tf(key, vars = {}) {
   const template = t(key);
   return String(template).replace(/\{(\w+)\}/g, (_, name) => String(vars[name] ?? ""));
@@ -735,6 +744,44 @@ async function fetchStreetViewLinks(panoId) {
       resolve(links);
     });
   });
+}
+
+async function hydrateIndoorNodeLinks(node) {
+  if (!node?.panoId) return node;
+  if (Array.isArray(node.links) && node.links.length > 0) return node;
+  const links = await fetchStreetViewLinks(node.panoId).catch(() => []);
+  node.links = links;
+  return node;
+}
+
+async function refreshIndoorCandidatesAround(node, radiusMeters = 220) {
+  if (!node || !Number.isFinite(Number(node.lat)) || !Number.isFinite(Number(node.lon))) {
+    return [];
+  }
+  const entry = await postJson("/api/streetview/find-indoor-entry", {
+    lat: Number(node.lat),
+    lon: Number(node.lon),
+    radiusMeters,
+  });
+  const candidates = Array.isArray(entry?.candidates) ? entry.candidates : [];
+  await Promise.all(candidates.map((candidate) => hydrateIndoorNodeLinks(candidate?.node)));
+  return candidates;
+}
+
+function getIndoorCandidateMetrics(candidate, currentNode) {
+  const node = candidate?.node || {};
+  const hasCurrent = Number.isFinite(Number(currentNode?.lat)) && Number.isFinite(Number(currentNode?.lon));
+  const hasCandidate = Number.isFinite(Number(node.lat)) && Number.isFinite(Number(node.lon));
+  const distanceMeters = hasCurrent && hasCandidate
+    ? Math.round(haversineMeters(Number(currentNode.lat), Number(currentNode.lon), Number(node.lat), Number(node.lon)))
+    : Math.round(Number(candidate?.distanceMeters) || 0);
+  const bearing = hasCurrent && hasCandidate
+    ? calculateBearing(Number(currentNode.lat), Number(currentNode.lon), Number(node.lat), Number(node.lon))
+    : Number(candidate?.bearing);
+  return {
+    distanceMeters,
+    direction: Number.isFinite(bearing) ? bearingToCompass(bearing) : "?",
+  };
 }
 
 function bearingToRelativeDir(bearing) {
@@ -1175,13 +1222,8 @@ function renderIndoorCandidateButtons(parentPanel) {
     btn.type = "button";
     btn.className = "link-button";
     const mark = i === state.quickStreet.selectedCandidateIndex ? "*" : "";
-    const currentNode = state.quickStreet.currentNode;
-    let relativeDistance = Math.round(Number(c.distanceMeters) || 0);
-    if (currentNode?.lat && currentNode?.lon && c.node?.lat && c.node?.lon) {
-      relativeDistance = Math.round(haversineMeters(currentNode.lat, currentNode.lon, c.node.lat, c.node.lon));
-    }
-    const direction = c.bearing !== undefined ? bearingToCompass(c.bearing) : "?";
-    btn.textContent = `${mark}入口 ${String.fromCharCode(65 + i)} (${relativeDistance}m) [${direction}]`;
+    const metrics = getIndoorCandidateMetrics(c, state.quickStreet.currentNode);
+    btn.textContent = `${mark}入口 ${String.fromCharCode(65 + i)} (${metrics.distanceMeters}m) [${metrics.direction}]`;
     btn.addEventListener("click", async () => {
       await switchIndoorCandidate(i, parentPanel);
     });
@@ -1209,6 +1251,8 @@ async function goBackIndoorNode(parentPanel) {
 
   state.quickStreet.currentNode = prevNode;
   state.quickStreet.availableLinks = prevNode.links || [];
+  state.quickStreet.indoorCandidates = await refreshIndoorCandidatesAround(prevNode);
+  state.quickStreet.selectedCandidateIndex = state.quickStreet.indoorCandidates.findIndex((c) => c?.node?.panoId === prevNode.panoId);
 
   parentPanel.classList.remove("error");
   parentPanel.innerHTML = "";
@@ -1219,6 +1263,7 @@ async function goBackIndoorNode(parentPanel) {
 async function switchIndoorCandidate(index, parentPanel) {
   const candidate = state.quickStreet.indoorCandidates[index];
   if (!candidate || !candidate.node || !candidate.node.panoId) return;
+  await hydrateIndoorNodeLinks(candidate.node);
 
   const currentNode = state.quickStreet.currentNode;
   if (currentNode?.panoId && currentNode.panoId !== candidate.node.panoId) {
@@ -1346,6 +1391,8 @@ async function moveQuickIndoorByBearing(bearing, parentPanel) {
   state.quickStreet.nodeHistory.push(currentNode);
   state.quickStreet.currentNode = nextNode;
   state.quickStreet.availableLinks = nextNode.links || [];
+  state.quickStreet.indoorCandidates = await refreshIndoorCandidatesAround(nextNode);
+  state.quickStreet.selectedCandidateIndex = state.quickStreet.indoorCandidates.findIndex((c) => c?.node?.panoId === nextNode.panoId);
 
   parentPanel.classList.remove("error");
   parentPanel.innerHTML = "";
@@ -1387,6 +1434,8 @@ async function navigateToLink(link, parentPanel) {
     }
     state.quickStreet.currentNode = nextNode.node;
     state.quickStreet.availableLinks = nextNode.node.links || [];
+    state.quickStreet.indoorCandidates = await refreshIndoorCandidatesAround(nextNode.node);
+    state.quickStreet.selectedCandidateIndex = state.quickStreet.indoorCandidates.findIndex((c) => c?.node?.panoId === nextNode.node.panoId);
     
     // Re-render
     parentPanel.classList.remove("error");
@@ -1465,6 +1514,8 @@ async function tryFindIndoorEntry(row, heading, panel) {
   }
 
   const candidates = Array.isArray(entry.candidates) ? entry.candidates : [];
+  await hydrateIndoorNodeLinks(entry.node);
+  await Promise.all(candidates.map((candidate) => hydrateIndoorNodeLinks(candidate?.node)));
 
   const streetData = await postJson("/api/paid/streetview", {
     userConfirmedPaidCall: true,
@@ -2362,6 +2413,8 @@ function createCard(row, index, total) {
           useLlm: false,
         });
         indoorNode = prev;
+        indoorCandidates = await refreshIndoorCandidatesAround(indoorNode);
+        selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === indoorNode.panoId);
         indoorResult.innerHTML = "";
         indoorResult.appendChild(createStreetResultSection(prevData));
         indoorResult.appendChild(renderCardIndoorControls());
@@ -2379,14 +2432,11 @@ function createCard(row, index, total) {
         btn.type = "button";
         btn.className = "link-button";
         const active = i === selectedIndoorCandidate ? "*" : "";
-        let relativeDistance = Math.round(Number(c.distanceMeters) || 0);
-        if (indoorNode?.lat && indoorNode?.lon && c.node?.lat && c.node?.lon) {
-          relativeDistance = Math.round(haversineMeters(indoorNode.lat, indoorNode.lon, c.node.lat, c.node.lon));
-        }
-        const direction = c.bearing !== undefined ? bearingToCompass(c.bearing) : "?";
-        btn.textContent = `${active}入口 ${String.fromCharCode(65 + i)} (${relativeDistance}m) [${direction}]`;
+        const metrics = getIndoorCandidateMetrics(c, indoorNode);
+        btn.textContent = `${active}入口 ${String.fromCharCode(65 + i)} (${metrics.distanceMeters}m) [${metrics.direction}]`;
         btn.addEventListener("click", async () => {
           if (!c?.node?.panoId) return;
+          await hydrateIndoorNodeLinks(c.node);
           if (indoorNode?.panoId && indoorNode.panoId !== c.node.panoId) {
             indoorHistory.push(indoorNode);
           }
@@ -2506,6 +2556,8 @@ function createCard(row, index, total) {
           links,
           providerHint: movedPano.providerHint || indoorNode?.providerHint || null,
         };
+        indoorCandidates = await refreshIndoorCandidatesAround(indoorNode);
+        selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === indoorNode.panoId);
         indoorResult.innerHTML = "";
         indoorResult.appendChild(createStreetResultSection(movedData));
         indoorResult.appendChild(renderCardIndoorControls());
@@ -2561,6 +2613,8 @@ function createCard(row, index, total) {
       indoorNode = entry.node;
       indoorHistory = [];
       indoorCandidates = Array.isArray(entry.candidates) ? entry.candidates : [];
+      await hydrateIndoorNodeLinks(indoorNode);
+      await Promise.all(indoorCandidates.map((candidate) => hydrateIndoorNodeLinks(candidate?.node)));
       selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === entry.node.panoId);
 
       indoorResult.innerHTML = "";
