@@ -2824,6 +2824,7 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
       heading: normalizeHeading(heading),
       copyright: metadata.copyright,
       date: metadata.date,
+      providerHint: extractProviderFromCopyright(metadata.copyright),
     },
     scenes,
     estimatedCalls,
@@ -2868,13 +2869,18 @@ async function handlePaidStreetViewPanoramaDescribe(request: Request, env: Env):
   const language = normalizeMapsLanguage(String(body.language || "zh-TW"));
   const rawImage = String(body.imageBase64 || "").trim();
   const imageBase64 = rawImage.includes(",") ? rawImage.split(",").pop() || "" : rawImage;
+  const question = String(body.question || "").trim();
+  const context = String(body.context || "").trim();
 
   if (!imageBase64 || imageBase64.length < 1000) {
     throw new Error("imageBase64 is required");
   }
 
   const geminiKey = requireGeminiKey(env);
-  const description = await fetchGeminiPanoramaDescription(geminiKey, imageBase64, language);
+  const description = await fetchGeminiPanoramaDescription(geminiKey, imageBase64, language, {
+    question,
+    context,
+  });
 
   await recordBilling(env, {
     provider: "streetview-panorama-description",
@@ -3681,15 +3687,27 @@ async function fetchGeminiPanoramaDescription(
   apiKey: string,
   imageBase64: string,
   language: string,
+  options: { question?: string; context?: string } = {},
 ): Promise<string> {
-  const prompt = [
-    `Please answer in ${language} and provide 2 to 4 complete sentences.`,
-    "This is a stitched 360-degree indoor panorama strip (left-to-right sequence of multiple directions).",
-    "Describe the surrounding environment for blind or low-vision wayfinding users.",
-    "Focus on practical landmarks: exits, stairs/escalators/elevators, gates, counters, corridor branching, and readable signs.",
-    "If a detail is uncertain, explicitly state uncertainty.",
-    "Do not output lists or JSON.",
-  ].join("\n");
+  const question = String(options.question || "").trim();
+  const context = String(options.context || "").trim();
+  const prompt = question
+    ? [
+        `Please answer in ${language} in 1 to 3 complete sentences.`,
+        "This is a stitched 360-degree indoor panorama strip (left-to-right sequence of multiple directions).",
+        context ? `Previous visual description: ${context}` : "",
+        `User follow-up question: ${question}`,
+        "Answer only from visible image evidence. If uncertain, explicitly state uncertainty.",
+        "Focus on practical wayfinding details.",
+      ].filter(Boolean).join("\n")
+    : [
+        `Please answer in ${language} and provide 2 to 4 complete sentences.`,
+        "This is a stitched 360-degree indoor panorama strip (left-to-right sequence of multiple directions).",
+        "Describe the surrounding environment for blind or low-vision wayfinding users.",
+        "Focus on practical landmarks: exits, stairs/escalators/elevators, gates, counters, corridor branching, and readable signs.",
+        "If a detail is uncertain, explicitly state uncertainty.",
+        "Do not output lists or JSON.",
+      ].join("\n");
 
   const reqBody = {
     contents: [

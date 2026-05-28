@@ -138,6 +138,16 @@ const I18N = {
     indoorDescribeResult: "室內環境描述：{text}",
     indoorMoveBy: "往{direction}移動 {meters}m",
     indoorMoveDone: "已往{direction}移動約 {meters}m",
+    indoorMoveUnavailable: "此方向沒有可靠的室內全景連結",
+    indoorMoveResult: "移動結果：{status}。目前 {provider}，候選入口：{candidates}",
+    indoorMoveChanged: "已切換至新的 Street View 點",
+    indoorMoveSame: "仍在同一 Street View 點",
+    indoorProvider: "影像來源：{provider}",
+    indoorCandidateMeta: "{label} - {provider}，{distance}m [{direction}]，{links} 個可行方向",
+    indoorCandidateCurrent: "目前點",
+    indoorFollowupPlaceholder: "對此圖像追問，例如：哪個方向有出口？",
+    indoorFollowupAsk: "追問",
+    indoorFollowupLoading: "正在回答追問...",
     indoorLowConfidenceManual: "室內導覽信心較低，請改以街景圖片與方向按鈕人工判讀。",
     indoorNeedManual: "目前無法可靠判斷下一步，請人工判讀。",
   },
@@ -241,6 +251,16 @@ const I18N = {
     indoorDescribeResult: "Indoor surroundings: {text}",
     indoorMoveBy: "Move {meters}m to {direction}",
     indoorMoveDone: "Moved about {meters}m to {direction}",
+    indoorMoveUnavailable: "No reliable indoor panorama link is available in this direction",
+    indoorMoveResult: "Move result: {status}. Current provider: {provider}. Candidates: {candidates}",
+    indoorMoveChanged: "switched to a new Street View point",
+    indoorMoveSame: "still on the same Street View point",
+    indoorProvider: "Image provider: {provider}",
+    indoorCandidateMeta: "{label} - {provider}, {distance}m [{direction}], {links} walkable directions",
+    indoorCandidateCurrent: "current spot",
+    indoorFollowupPlaceholder: "Ask about this image, e.g. which direction has an exit?",
+    indoorFollowupAsk: "Ask",
+    indoorFollowupLoading: "Answering follow-up...",
     indoorLowConfidenceManual: "Indoor navigation confidence is low. Please decide manually using Street View images and direction buttons.",
     indoorNeedManual: "Cannot reliably determine the next indoor step. Please decide manually.",
   },
@@ -344,6 +364,16 @@ const I18N = {
     indoorDescribeResult: "室内環境: {text}",
     indoorMoveBy: "{direction}へ {meters}m 移動",
     indoorMoveDone: "{direction}へ約 {meters}m 移動しました",
+    indoorMoveUnavailable: "この方向には信頼できる屋内パノラマリンクがありません",
+    indoorMoveResult: "移動結果: {status}。現在の提供元: {provider}。候補入口: {candidates}",
+    indoorMoveChanged: "新しい Street View ポイントへ切替",
+    indoorMoveSame: "同じ Street View ポイントのまま",
+    indoorProvider: "画像提供元: {provider}",
+    indoorCandidateMeta: "{label} - {provider}、{distance}m [{direction}]、移動可能方向 {links} 件",
+    indoorCandidateCurrent: "現在地",
+    indoorFollowupPlaceholder: "この画像について質問（例: 出口はどの方向ですか？）",
+    indoorFollowupAsk: "質問",
+    indoorFollowupLoading: "追加質問に回答中...",
     indoorLowConfidenceManual: "屋内ナビの信頼度が低いため、Street View画像と方向ボタンで手動判断してください。",
     indoorNeedManual: "次の屋内ステップを信頼して判定できません。手動で判断してください。",
   },
@@ -447,6 +477,16 @@ const I18N = {
     indoorDescribeResult: "실내 환경: {text}",
     indoorMoveBy: "{direction} 방향으로 {meters}m 이동",
     indoorMoveDone: "{direction} 방향으로 약 {meters}m 이동했습니다",
+    indoorMoveUnavailable: "이 방향에는 신뢰할 수 있는 실내 파노라마 링크가 없습니다",
+    indoorMoveResult: "이동 결과: {status}. 현재 제공자: {provider}. 후보 입구: {candidates}",
+    indoorMoveChanged: "새 Street View 지점으로 전환됨",
+    indoorMoveSame: "같은 Street View 지점에 머무름",
+    indoorProvider: "이미지 제공자: {provider}",
+    indoorCandidateMeta: "{label} - {provider}, {distance}m [{direction}], 이동 가능 방향 {links}개",
+    indoorCandidateCurrent: "현재 지점",
+    indoorFollowupPlaceholder: "이 이미지에 대해 질문하세요. 예: 출구는 어느 방향인가요?",
+    indoorFollowupAsk: "질문",
+    indoorFollowupLoading: "추가 질문에 답변 중...",
     indoorLowConfidenceManual: "실내 안내 신뢰도가 낮습니다. Street View 이미지와 방향 버튼으로 수동 판단해 주세요.",
     indoorNeedManual: "다음 실내 이동을 신뢰성 있게 판단할 수 없습니다. 수동으로 판단해 주세요.",
   },
@@ -490,6 +530,11 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
   const y = Math.sin(dLambda) * Math.cos(p2);
   const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dLambda);
   return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+function bearingDeltaAbs(a, b) {
+  const diff = (((Number(a) - Number(b)) % 360) + 540) % 360 - 180;
+  return Math.abs(diff);
 }
 
 function tf(key, vars = {}) {
@@ -781,7 +826,79 @@ function getIndoorCandidateMetrics(candidate, currentNode) {
   return {
     distanceMeters,
     direction: Number.isFinite(bearing) ? bearingToCompass(bearing) : "?",
+    isCurrent: Boolean(currentNode?.panoId && node.panoId && currentNode.panoId === node.panoId) || distanceMeters <= 2,
   };
+}
+
+function providerLabel(nodeOrData) {
+  return String(nodeOrData?.providerHint || nodeOrData?.panorama?.providerHint || "Street View").trim() || "Street View";
+}
+
+function attachPanoramaProviderHint(data, node) {
+  if (!data || !node?.providerHint) return data;
+  data.panorama = data.panorama || {};
+  data.panorama.providerHint = node.providerHint;
+  return data;
+}
+
+function getBestIndoorMoveLink(links, bearing) {
+  const usable = Array.isArray(links)
+    ? links.filter((link) => link?.panoId && Number.isFinite(Number(link.heading)))
+    : [];
+  if (!usable.length) return null;
+  let best = usable[0];
+  let bestDelta = bearingDeltaAbs(bearing, best.heading);
+  for (let i = 1; i < usable.length; i += 1) {
+    const delta = bearingDeltaAbs(bearing, usable[i].heading);
+    if (delta < bestDelta) {
+      best = usable[i];
+      bestDelta = delta;
+    }
+  }
+  return bestDelta <= 55 ? { link: best, delta: Math.round(bestDelta) } : null;
+}
+
+function formatIndoorCandidateButton(candidate, index, currentNode, active) {
+  const metrics = getIndoorCandidateMetrics(candidate, currentNode);
+  const label = `入口 ${String.fromCharCode(65 + index)}`;
+  const provider = providerLabel(candidate?.node);
+  const linkCount = Array.isArray(candidate?.node?.links) ? candidate.node.links.length : 0;
+  const place = metrics.isCurrent ? t("indoorCandidateCurrent") : `${metrics.distanceMeters}m [${metrics.direction}]`;
+  const prefix = active ? "*" : "";
+  return `${prefix}${tf("indoorCandidateMeta", {
+    label,
+    provider,
+    distance: metrics.distanceMeters,
+    direction: metrics.isCurrent ? t("indoorCandidateCurrent") : metrics.direction,
+    links: linkCount,
+  })}${metrics.isCurrent ? ` (${place})` : ""}`;
+}
+
+function summarizeIndoorCandidates(candidates, currentNode) {
+  if (!Array.isArray(candidates) || !candidates.length) return t("none");
+  return candidates.slice(0, 3).map((candidate, index) => {
+    const metrics = getIndoorCandidateMetrics(candidate, currentNode);
+    const label = `入口 ${String.fromCharCode(65 + index)}`;
+    const place = metrics.isCurrent ? t("indoorCandidateCurrent") : `${metrics.distanceMeters}m ${metrics.direction}`;
+    return `${label} ${place}`;
+  }).join("；");
+}
+
+function buildIndoorMoveResultMessage(direction, meters, previousNode, nextNode, candidates) {
+  const changed = previousNode?.panoId && nextNode?.panoId && previousNode.panoId !== nextNode.panoId;
+  const status = changed ? t("indoorMoveChanged") : t("indoorMoveSame");
+  return `${tf("indoorMoveDone", { direction, meters })}\n${tf("indoorMoveResult", {
+    status,
+    provider: providerLabel(nextNode),
+    candidates: summarizeIndoorCandidates(candidates, nextNode),
+  })}`;
+}
+
+function appendIndoorStatus(container, message) {
+  const status = document.createElement("div");
+  status.className = "minor indoor-status";
+  status.textContent = message;
+  container.appendChild(status);
 }
 
 function bearingToRelativeDir(bearing) {
@@ -1134,8 +1251,13 @@ function renderIndoorNavigation(node, parentPanel) {
   container.className = "indoor-nav-section";
   
   const header = document.createElement("h4");
-  header.textContent = `${t("indoorNav")} - ${node.providerHint || "Street View"}`;
+  header.textContent = `${t("indoorNav")} - ${providerLabel(node)}`;
   container.appendChild(header);
+
+  const provider = document.createElement("div");
+  provider.className = "minor indoor-provider";
+  provider.textContent = tf("indoorProvider", { provider: providerLabel(node) });
+  container.appendChild(provider);
 
   if (state.quickStreet.nodeHistory.length > 0) {
     const backBtn = document.createElement("button");
@@ -1169,6 +1291,14 @@ function renderIndoorNavigation(node, parentPanel) {
     btn.type = "button";
     btn.className = "link-button";
     btn.textContent = tf("indoorMoveBy", { direction: t(dir.key), meters: 5 });
+    const bestLink = getBestIndoorMoveLink(state.quickStreet.availableLinks, dir.bearing);
+    if (!bestLink) {
+      btn.disabled = true;
+      btn.title = t("indoorMoveUnavailable");
+      btn.setAttribute("aria-disabled", "true");
+    } else {
+      btn.title = `${bestLink.link.label || bestLink.link.description || ""} (${Math.round(bestLink.link.heading)}°, Δ${bestLink.delta}°)`;
+    }
     btn.addEventListener("click", async () => {
       await moveQuickIndoorByBearing(dir.bearing, parentPanel);
     });
@@ -1221,9 +1351,7 @@ function renderIndoorCandidateButtons(parentPanel) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "link-button";
-    const mark = i === state.quickStreet.selectedCandidateIndex ? "*" : "";
-    const metrics = getIndoorCandidateMetrics(c, state.quickStreet.currentNode);
-    btn.textContent = `${mark}入口 ${String.fromCharCode(65 + i)} (${metrics.distanceMeters}m) [${metrics.direction}]`;
+    btn.textContent = formatIndoorCandidateButton(c, i, state.quickStreet.currentNode, i === state.quickStreet.selectedCandidateIndex);
     btn.addEventListener("click", async () => {
       await switchIndoorCandidate(i, parentPanel);
     });
@@ -1256,7 +1384,7 @@ async function goBackIndoorNode(parentPanel) {
 
   parentPanel.classList.remove("error");
   parentPanel.innerHTML = "";
-  parentPanel.appendChild(createStreetResultSection(streetData));
+  parentPanel.appendChild(createStreetResultSection(attachPanoramaProviderHint(streetData, prevNode)));
   parentPanel.appendChild(renderIndoorNavigation(prevNode, parentPanel));
 }
 
@@ -1288,7 +1416,7 @@ async function switchIndoorCandidate(index, parentPanel) {
 
   parentPanel.classList.remove("error");
   parentPanel.innerHTML = "";
-  parentPanel.appendChild(createStreetResultSection(streetData));
+  parentPanel.appendChild(createStreetResultSection(attachPanoramaProviderHint(streetData, candidate.node)));
 
   const hint = document.createElement("div");
   hint.className = "minor";
@@ -1345,6 +1473,7 @@ async function moveQuickIndoorByBearing(bearing, parentPanel) {
       language: getMapLanguage(),
       useLlm: false,
     });
+    attachPanoramaProviderHint(streetData, resolvedNode);
     const links = await fetchStreetViewLinks(resolvedNode.panoId).catch(() => []);
     nextNode = {
       panoId: resolvedNode.panoId,
@@ -1396,10 +1525,10 @@ async function moveQuickIndoorByBearing(bearing, parentPanel) {
 
   parentPanel.classList.remove("error");
   parentPanel.innerHTML = "";
-  parentPanel.appendChild(createStreetResultSection(streetData));
+  parentPanel.appendChild(createStreetResultSection(attachPanoramaProviderHint(streetData, nextNode)));
+  const message = buildIndoorMoveResultMessage(directionLabelFromBearing(bearing), 5, currentNode, nextNode, state.quickStreet.indoorCandidates);
+  appendIndoorStatus(parentPanel, message);
   parentPanel.appendChild(renderIndoorNavigation(nextNode, parentPanel));
-
-  const message = tf("indoorMoveDone", { direction: directionLabelFromBearing(bearing), meters: 5 });
   announceLive(message);
   updateQuickNavStatus(message);
 }
@@ -1450,6 +1579,7 @@ async function navigateToLink(link, parentPanel) {
         panoId: nextNode.node.panoId,
         description: "室內街景",
         links: nextNode.node.links,
+        providerHint: nextNode.node.providerHint || null,
       },
     });
     parentPanel.appendChild(streetSection);
@@ -1530,7 +1660,7 @@ async function tryFindIndoorEntry(row, heading, panel) {
   });
 
   panel.innerHTML = "";
-  panel.appendChild(createStreetResultSection(streetData));
+  panel.appendChild(createStreetResultSection(attachPanoramaProviderHint(streetData, entry.node)));
 
   const hint = document.createElement("div");
   hint.className = "minor";
@@ -1912,6 +2042,13 @@ function createStreetResultSection(data, titleText = "") {
   intro.textContent = extractStreetBlocks(data?.text || "");
   section.appendChild(intro);
 
+  if (data?.panorama?.providerHint) {
+    const provider = document.createElement("div");
+    provider.className = "minor indoor-provider";
+    provider.textContent = tf("indoorProvider", { provider: providerLabel(data) });
+    section.appendChild(provider);
+  }
+
   const scenes = getStreetScenes(data);
   if (!scenes.length) {
     return section;
@@ -1934,7 +2071,32 @@ function createStreetResultSection(data, titleText = "") {
   const llmSummary = document.createElement("div");
   llmSummary.className = "street-pano-caption";
 
+  const followupBox = document.createElement("div");
+  followupBox.className = "indoor-followup";
+  followupBox.hidden = true;
+
+  const followupInput = document.createElement("textarea");
+  followupInput.className = "indoor-followup-input";
+  followupInput.rows = 3;
+  followupInput.placeholder = t("indoorFollowupPlaceholder");
+  followupBox.appendChild(followupInput);
+
+  const followupActions = document.createElement("div");
+  followupActions.className = "indoor-followup-actions";
+  const followupBtn = document.createElement("button");
+  followupBtn.type = "button";
+  followupBtn.className = "street-scene-btn paid";
+  followupBtn.textContent = t("indoorFollowupAsk");
+  followupActions.appendChild(followupBtn);
+  followupBox.appendChild(followupActions);
+
+  const followupResult = document.createElement("div");
+  followupResult.className = "street-pano-caption";
+  followupBox.appendChild(followupResult);
+
   let activeIndex = 0;
+  let panoramaStripBase64 = "";
+  let panoramaDescription = "";
   const applyScene = () => {
     const scene = scenes[activeIndex];
     img.src = scene.imageUrl;
@@ -1977,14 +2139,16 @@ function createStreetResultSection(data, titleText = "") {
     llmSummary.textContent = t("indoorDescribeLoading");
     announceLive(t("indoorDescribeLoading"));
     try {
-      const imageBase64 = await composePanoramaStripBase64(scenes);
+      panoramaStripBase64 = panoramaStripBase64 || await composePanoramaStripBase64(scenes);
       const result = await postJson("/api/paid/streetview/panorama-describe", {
         userConfirmedPaidCall: true,
         language: getMapLanguage(),
-        imageBase64,
+        imageBase64: panoramaStripBase64,
       });
-      const resultText = tf("indoorDescribeResult", { text: String(result.description || "").trim() });
+      panoramaDescription = String(result.description || "").trim();
+      const resultText = tf("indoorDescribeResult", { text: panoramaDescription });
       llmSummary.textContent = resultText;
+      followupBox.hidden = false;
       announceLive(resultText);
     } catch (err) {
       const msg = `${t("errorPrefix")}${err.message}`;
@@ -1996,10 +2160,44 @@ function createStreetResultSection(data, titleText = "") {
   });
   sceneButtons.appendChild(describeBtn);
 
+  followupBtn.addEventListener("click", async () => {
+    const question = followupInput.value.trim();
+    if (!question) return;
+    const blocked = getPaidBlockedMessage();
+    if (blocked) {
+      followupResult.textContent = blocked;
+      announceLive(blocked);
+      return;
+    }
+    followupBtn.disabled = true;
+    followupResult.textContent = t("indoorFollowupLoading");
+    announceLive(t("indoorFollowupLoading"));
+    try {
+      panoramaStripBase64 = panoramaStripBase64 || await composePanoramaStripBase64(scenes);
+      const result = await postJson("/api/paid/streetview/panorama-describe", {
+        userConfirmedPaidCall: true,
+        language: getMapLanguage(),
+        imageBase64: panoramaStripBase64,
+        question,
+        context: panoramaDescription,
+      });
+      const answer = String(result.description || "").trim();
+      followupResult.textContent = answer;
+      announceLive(answer);
+    } catch (err) {
+      const msg = `${t("errorPrefix")}${err.message}`;
+      followupResult.textContent = msg;
+      announceLive(msg);
+    } finally {
+      followupBtn.disabled = false;
+    }
+  });
+
   viewer.appendChild(img);
   viewer.appendChild(sceneButtons);
   viewer.appendChild(caption);
   viewer.appendChild(llmSummary);
+  viewer.appendChild(followupBox);
   section.appendChild(viewer);
 
   if (data?.indoorLikely) {
@@ -2392,6 +2590,13 @@ function createCard(row, index, total) {
     const controls = document.createElement("div");
     controls.className = "pano-links";
 
+    if (indoorNode?.panoId) {
+      const provider = document.createElement("div");
+      provider.className = "minor indoor-provider";
+      provider.textContent = tf("indoorProvider", { provider: providerLabel(indoorNode) });
+      controls.appendChild(provider);
+    }
+
     if (indoorHistory.length > 0) {
       const backBtn = document.createElement("button");
       backBtn.type = "button";
@@ -2416,7 +2621,7 @@ function createCard(row, index, total) {
         indoorCandidates = await refreshIndoorCandidatesAround(indoorNode);
         selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === indoorNode.panoId);
         indoorResult.innerHTML = "";
-        indoorResult.appendChild(createStreetResultSection(prevData));
+        indoorResult.appendChild(createStreetResultSection(attachPanoramaProviderHint(prevData, indoorNode)));
         indoorResult.appendChild(renderCardIndoorControls());
         const msg = t("indoorBackPrev");
         announceLive(msg);
@@ -2431,9 +2636,7 @@ function createCard(row, index, total) {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "link-button";
-        const active = i === selectedIndoorCandidate ? "*" : "";
-        const metrics = getIndoorCandidateMetrics(c, indoorNode);
-        btn.textContent = `${active}入口 ${String.fromCharCode(65 + i)} (${metrics.distanceMeters}m) [${metrics.direction}]`;
+        btn.textContent = formatIndoorCandidateButton(c, i, indoorNode, i === selectedIndoorCandidate);
         btn.addEventListener("click", async () => {
           if (!c?.node?.panoId) return;
           await hydrateIndoorNodeLinks(c.node);
@@ -2454,7 +2657,7 @@ function createCard(row, index, total) {
           indoorNode = c.node;
           selectedIndoorCandidate = i;
           indoorResult.innerHTML = "";
-          indoorResult.appendChild(createStreetResultSection(switched));
+          indoorResult.appendChild(createStreetResultSection(attachPanoramaProviderHint(switched, indoorNode)));
           const hint = document.createElement("div");
           hint.className = "minor";
           const switchedMessage = tf("indoorSwitchedCandidate", {
@@ -2486,6 +2689,14 @@ function createCard(row, index, total) {
       btn.type = "button";
       btn.className = "link-button";
       btn.textContent = tf("indoorMoveBy", { direction: t(dir.key), meters: 5 });
+      const bestLink = getBestIndoorMoveLink(indoorNode?.links, dir.bearing);
+      if (!bestLink) {
+        btn.disabled = true;
+        btn.title = t("indoorMoveUnavailable");
+        btn.setAttribute("aria-disabled", "true");
+      } else {
+        btn.title = `${bestLink.link.label || bestLink.link.description || ""} (${Math.round(bestLink.link.heading)}°, Δ${bestLink.delta}°)`;
+      }
       btn.addEventListener("click", async () => {
         if (!indoorNode?.panoId || !Number.isFinite(Number(indoorNode?.lat)) || !Number.isFinite(Number(indoorNode?.lon))) return;
         const decisionResp = await postJson("/api/streetview/indoor-step", {
@@ -2506,6 +2717,7 @@ function createCard(row, index, total) {
 
         let movedData = null;
         let movedPano = null;
+        const previousIndoorNode = indoorNode;
         if (decision?.mode === "link" && decision?.selectedLink?.panoId) {
           const resolved = await postJson("/api/streetview/resolve-pano", {
             userConfirmedPaidCall: true,
@@ -2525,6 +2737,7 @@ function createCard(row, index, total) {
             language: getMapLanguage(),
             useLlm: false,
           });
+          attachPanoramaProviderHint(movedData, resolvedNode);
           movedPano = movedData?.panorama || {};
         } else if (decision?.mode === "offset" && Number.isFinite(Number(decision?.target?.lat)) && Number.isFinite(Number(decision?.target?.lon))) {
           movedData = await postJson("/api/paid/streetview", {
@@ -2559,9 +2772,10 @@ function createCard(row, index, total) {
         indoorCandidates = await refreshIndoorCandidatesAround(indoorNode);
         selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === indoorNode.panoId);
         indoorResult.innerHTML = "";
-        indoorResult.appendChild(createStreetResultSection(movedData));
+        indoorResult.appendChild(createStreetResultSection(attachPanoramaProviderHint(movedData, indoorNode)));
+        const movedMsg = buildIndoorMoveResultMessage(t(dir.key), 5, previousIndoorNode, indoorNode, indoorCandidates);
+        appendIndoorStatus(indoorResult, movedMsg);
         indoorResult.appendChild(renderCardIndoorControls());
-        const movedMsg = tf("indoorMoveDone", { direction: t(dir.key), meters: 5 });
         announceLive(movedMsg);
         updateQuickNavStatus(movedMsg);
       });
@@ -2618,7 +2832,7 @@ function createCard(row, index, total) {
       selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === entry.node.panoId);
 
       indoorResult.innerHTML = "";
-      indoorResult.appendChild(createStreetResultSection(targetData));
+      indoorResult.appendChild(createStreetResultSection(attachPanoramaProviderHint(targetData, indoorNode)));
       const hint = document.createElement("div");
       hint.className = "minor";
       hint.textContent = tf("indoorSwitched", { meters: Math.round(Number(entry.distanceMeters) || 0) });

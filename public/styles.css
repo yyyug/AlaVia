@@ -111,13 +111,15 @@ label {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-input {
+input,
+textarea {
   width: 100%;
   margin-top: 6px;
   border: 1px solid #b8c4b9;
   border-radius: 10px;
   padding: 10px;
   font-size: 16px;
+  font-family: inherit;
 }
 
 button {
@@ -139,7 +141,7 @@ button.paid {
 
 button[disabled] {
   opacity: 0.6;
-  cursor: wait;
+  cursor: not-allowed;
 }
 
 .actions {
@@ -299,6 +301,33 @@ button[disabled] {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px dashed #c8d4c8;
+}
+
+.indoor-provider {
+  grid-column: 1 / -1;
+  width: 100%;
+}
+
+.indoor-status {
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+
+.indoor-followup {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed #c8d4c8;
+}
+
+.indoor-followup-input {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.indoor-followup-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
 }
 
 .street-advance-label {
