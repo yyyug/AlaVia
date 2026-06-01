@@ -13,7 +13,7 @@ This file is the single source of truth for AlaVia backend architecture, API con
   - R2: cached payload blobs and hot tile cache
   - Optional R2 PMTiles archive: pmtiles/hongkong-z16.pmtiles
 - External APIs:
-  - OpenStreetMap Nominatim (search/reverse)
+  - OpenStreetMap Overpass (road search/reverse-road lookup)
   - OpenStreetMap Overpass
   - Google Maps APIs (Street View, Places)
   - Gemini API (text generation)

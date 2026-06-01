@@ -269,7 +269,7 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
     throw new Error("query is required");
   }
 
-  const cacheKey = await buildCacheKey("geocode-autobbox-v1", {
+  const cacheKey = await buildCacheKey("geocode-autobbox-v2", {
     query: query.toLowerCase(),
     countryCode,
   });
@@ -282,50 +282,7 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
 
   const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
 
-  let items: Array<Record<string, unknown>> = [];
-  let resolvedCountryCode = "";
-
-  if (normalizedCountry === "hk") {
-    const hkItems = await fetchNominatimSearch(query, "hk");
-    if (hkItems.length > 0) {
-      items = hkItems;
-      resolvedCountryCode = "hk";
-    } else {
-      const cnQueryCandidates = [`香港${query}`, `Hong Kong ${query}`, query];
-      for (const q of cnQueryCandidates) {
-        const cnItems = await fetchNominatimSearch(q, "cn");
-        if (cnItems.length > 0) {
-          items = cnItems;
-          resolvedCountryCode = "cn";
-          break;
-        }
-      }
-    }
-  } else if (normalizedCountry) {
-    // Try multiple query variants for better CJK compatibility
-    const queryVariants = buildQueryVariants(query);
-    for (const q of queryVariants) {
-      const filteredItems = await fetchNominatimSearch(q, normalizedCountry);
-      if (filteredItems.length > 0) {
-        items = filteredItems;
-        resolvedCountryCode = normalizedCountry;
-        break;
-      }
-    }
-    // Fallback: try without country filter
-    if (!items.length) {
-      for (const q of queryVariants) {
-        const anyItems = await fetchNominatimSearch(q, "");
-        if (anyItems.length > 0) {
-          items = anyItems;
-          resolvedCountryCode = normalizedCountry;
-          break;
-        }
-      }
-    }
-  } else {
-    items = await fetchNominatimSearch(query, "");
-  }
+  const items = await fetchOverpassRoadSearch(query, normalizedCountry);
 
   if (!Array.isArray(items) || items.length === 0) {
     throw new Error(`Geocode no result for query "${query}" (country: ${countryCode || "any"})`);
@@ -368,7 +325,7 @@ async function handleGeocodeAutoBbox(request: Request): Promise<Response> {
   const payload = {
     ok: true,
     query,
-    countryCode: resolvedCountryCode ? resolvedCountryCode.toUpperCase() : (normalizedCountry ? normalizedCountry.toUpperCase() : null),
+    countryCode: normalizedCountry ? normalizedCountry.toUpperCase() : null,
     displayName: String(first.display_name || query),
     roadName: extractRoadNameFromGeocodeRecord(first, query),
     lat: Number(first.lat),
@@ -400,7 +357,7 @@ async function handleGeocodeReverseRoad(request: Request, env: Env, ctx: Executi
   const lon = Number(body.lon);
   validateCoordinates(lat, lon);
 
-  const reverse = await fetchNominatimReverse(env, lat, lon, ctx);
+  const reverse = await fetchOverpassReverseRoad(env, lat, lon, ctx);
   const roadName = extractRoadNameFromGeocodeRecord(reverse, "");
   if (!roadName) {
     throw new Error("Reverse geocode road not found");
@@ -473,30 +430,108 @@ function validateCoordinates(lat: number, lon: number): void {
   }
 }
 
-async function fetchNominatimSearch(query: string, countryCode = ""): Promise<Array<Record<string, unknown>>> {
-  const p = new URLSearchParams({
-    q: query,
-    format: "jsonv2",
-    limit: "1",
-    addressdetails: "1",
-  });
-  if (countryCode) {
-    p.set("countrycodes", countryCode);
+function escapeOverpassString(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function escapeOverpassRegex(value: string): string {
+  return escapeOverpassString(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+}
+
+function getOverpassElementCoordinates(element: Json): Array<{ lat: number; lon: number }> {
+  const geometry = Array.isArray(element.geometry) ? (element.geometry as Json[]) : [];
+  const coordinates = geometry
+    .map((point) => ({ lat: Number(point.lat), lon: Number(point.lon) }))
+    .filter((point) => Number.isFinite(point.lat) && Number.isFinite(point.lon));
+  if (coordinates.length) {
+    return coordinates;
   }
 
-  const url = `https://nominatim.openstreetmap.org/search?${p.toString()}`;
-  const res = await fetchWithTimeout(url, {
-    method: "GET",
-    headers: {
-      accept: "application/json",
-      "user-agent": "AlaViaBlindMap/0.1 (contact: yoofun@gmail.com)",
-    },
-  });
-  if (!res.ok) {
-    throw new Error(`Geocode error: ${res.status}`);
+  const center = (element.center || {}) as Json;
+  const lat = Number(center.lat ?? element.lat);
+  const lon = Number(center.lon ?? element.lon);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? [{ lat, lon }] : [];
+}
+
+function getOverpassElementBBox(element: Json): BBox | null {
+  const coordinates = getOverpassElementCoordinates(element);
+  if (!coordinates.length) {
+    return null;
   }
-  const items = (await res.json()) as Array<Record<string, unknown>>;
-  return Array.isArray(items) ? items : [];
+  return {
+    south: Math.min(...coordinates.map((point) => point.lat)),
+    west: Math.min(...coordinates.map((point) => point.lon)),
+    north: Math.max(...coordinates.map((point) => point.lat)),
+    east: Math.max(...coordinates.map((point) => point.lon)),
+  };
+}
+
+function getOverpassElementDistanceMeters(origin: { lat: number; lon: number }, element: Json): number {
+  const coordinates = getOverpassElementCoordinates(element);
+  if (!coordinates.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (coordinates.length === 1) {
+    return haversineMeters(origin, coordinates[0]);
+  }
+
+  let nearest = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < coordinates.length; index += 1) {
+    nearest = Math.min(
+      nearest,
+      projectPointToSegmentMeters(coordinates[index - 1], coordinates[index], origin).distanceToLineMeters,
+    );
+  }
+  return nearest;
+}
+
+function buildOverpassRoadSearchQuery(query: string, countryCode: string, bbox = ""): string {
+  const exactName = escapeOverpassString(query);
+  const regexName = escapeOverpassRegex(query);
+  const area = countryCode
+    ? `area["ISO3166-1"="${escapeOverpassString(countryCode.toUpperCase())}"]["boundary"="administrative"]->.country;`
+    : "";
+  const scope = bbox ? `(${bbox})` : (countryCode ? "(area.country)" : "");
+  const comparator = bbox || countryCode ? `~"^${regexName}($| )",i` : `="${exactName}"`;
+  return `[out:json][timeout:25];${area}(` +
+    `way${scope}["highway"]["name"${comparator}];` +
+    `way${scope}["highway"]["name:zh"${comparator}];` +
+    `way${scope}["highway"]["name:en"${comparator}];` +
+    `);out center geom tags;`;
+}
+
+async function fetchOverpassRoadSearch(query: string, countryCode = ""): Promise<Array<Record<string, unknown>>> {
+  const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
+  const variants = buildQueryVariants(query);
+  const scopes = normalizedCountry === "hk"
+    ? [{ countryCode: "hk", bbox: "" }, { countryCode: "", bbox: "22.13,113.82,22.58,114.51" }]
+    : (normalizedCountry ? [{ countryCode: normalizedCountry, bbox: "" }, { countryCode: "", bbox: "" }] : [{ countryCode: "", bbox: "" }]);
+
+  for (const scope of scopes) {
+    for (const variant of variants) {
+      const result = await fetchOverpassJson(buildOverpassRoadSearchQuery(variant, scope.countryCode, scope.bbox));
+      const elements = Array.isArray(result.data.elements) ? (result.data.elements as Json[]) : [];
+      const records = elements.map((element) => {
+        const tags = (element.tags || {}) as Json;
+        const coordinates = getOverpassElementCoordinates(element);
+        const bbox = getOverpassElementBBox(element);
+        const midpoint = coordinates[Math.floor(coordinates.length / 2)] || { lat: Number.NaN, lon: Number.NaN };
+        const roadName = String(tags.name || tags["name:zh"] || tags["name:en"] || variant).trim();
+        return {
+          name: roadName,
+          display_name: roadName,
+          lat: midpoint.lat,
+          lon: midpoint.lon,
+          boundingbox: bbox ? [bbox.south, bbox.north, bbox.west, bbox.east].map(String) : [],
+          address: { road: roadName },
+        };
+      });
+      if (records.length) {
+        return records;
+      }
+    }
+  }
+  return [];
 }
 
 async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -525,7 +560,7 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
   const countryCode = String(body.countryCode || "").trim().toLowerCase();
   validateCoordinates(lat, lon);
 
-  const reverse = await fetchNominatimReverse(env, lat, lon, ctx);
+  const reverse = await fetchOverpassReverseRoad(env, lat, lon, ctx);
   const roadName = extractRoadNameFromGeocodeRecord(reverse, "");
   if (!roadName) {
     throw new Error("Could not determine road from coordinates");
@@ -573,8 +608,8 @@ async function fetchSegmentData(
     "osm-segment-v2",
     cachePayload,
     async () => {
-      // Nominatim + Overpass are only called on a true cache miss.
-      // Use the client-provided focusPoint if available to skip the extra Nominatim call.
+      // Overpass is only called on a true cache miss.
+      // Use the client-provided focusPoint if available to skip the extra road lookup.
       const geo = await resolveRoadBBox(roadName, countryCode, focusPoint);
       const south = geo.bbox.south;
       const west = geo.bbox.west;
@@ -1203,34 +1238,50 @@ async function fetchOverpassJsonWithEndpoints(
   throw new Error(`Overpass error: ${lastStatus}`);
 }
 
-async function fetchNominatimReverse(env: Env, lat: number, lon: number, ctx?: ExecutionContext): Promise<Json> {
+function buildOverpassReverseRoadQuery(lat: number, lon: number): string {
+  return `[out:json][timeout:20];(` +
+    `way(around:90,${lat},${lon})["highway"]["name"];` +
+    `nwr(around:45,${lat},${lon})["addr:housenumber"];` +
+    `);out center geom tags;`;
+}
+
+async function fetchOverpassReverseRoad(env: Env, lat: number, lon: number, ctx?: ExecutionContext): Promise<Json> {
   const payload = { lat: round6(lat), lon: round6(lon) };
   const cached = await getOrCreateCached(
     env,
-    "geocode-reverse-v2",
+    "overpass-reverse-road-v1",
     payload,
     async () => {
-      const p = new URLSearchParams({
-        lat: String(payload.lat),
-        lon: String(payload.lon),
-        format: "jsonv2",
-        addressdetails: "1",
-        zoom: "18",
-      });
-
-      const url = `https://nominatim.openstreetmap.org/reverse?${p.toString()}`;
-      const res = await fetchWithTimeout(url, {
-        method: "GET",
-        headers: {
-          accept: "application/json",
-          "user-agent": "AlaViaBlindMap/0.1 (contact: yoofun@gmail.com)",
-        },
-      });
-      if (!res.ok) {
-        throw new Error(`Reverse geocode error: ${res.status}`);
+      const result = await fetchOverpassJson(buildOverpassReverseRoadQuery(payload.lat, payload.lon));
+      const elements = Array.isArray(result.data.elements) ? (result.data.elements as Json[]) : [];
+      const origin = { lat: payload.lat, lon: payload.lon };
+      const roads = elements
+        .filter((element) => {
+          const tags = (element.tags || {}) as Json;
+          return element.type === "way" && Boolean(tags.highway) && Boolean(tags.name);
+        })
+        .sort((a, b) => getOverpassElementDistanceMeters(origin, a) - getOverpassElementDistanceMeters(origin, b));
+      const nearestRoad = roads[0];
+      if (!nearestRoad) {
+        throw new Error("Reverse geocode road not found");
       }
-
-      return (await res.json()) as Json;
+      const roadTags = (nearestRoad.tags || {}) as Json;
+      const roadName = String(roadTags.name || roadTags["name:zh"] || roadTags["name:en"] || "").trim();
+      const addresses = elements
+        .filter((element) => Boolean(((element.tags || {}) as Json)["addr:housenumber"]))
+        .sort((a, b) => getOverpassElementDistanceMeters(origin, a) - getOverpassElementDistanceMeters(origin, b));
+      const nearestAddress = addresses[0];
+      const addressTags = ((nearestAddress?.tags || {}) as Json);
+      const houseNumber = String(addressTags["addr:housenumber"] || "").trim();
+      const streetName = String(addressTags["addr:street"] || roadName).trim();
+      return {
+        display_name: houseNumber ? `${houseNumber} ${streetName}` : roadName,
+        address: {
+          road: roadName,
+          street: streetName,
+          house_number: houseNumber,
+        },
+      };
     },
     TTL_365_DAYS,
     {
@@ -1542,7 +1593,7 @@ async function handleIntersectionAddressBatch(request: Request, env: Env, ctx: E
   const rows = await Promise.all(
     points.map(async (point) => {
       try {
-        const reverse = await fetchNominatimReverse(env, point.lat, point.lon, ctx);
+        const reverse = await fetchOverpassReverseRoad(env, point.lat, point.lon, ctx);
         const address = buildIntersectionAddressLabel(reverse, roadName);
         return {
           idx: point.idx,
@@ -1591,13 +1642,13 @@ async function handleCoordinateBatch(
     validateCoordinates(lat, lon);
     
     try {
-      const reverse = await fetchNominatimReverse(env, lat, lon, ctx);
+      const reverse = await fetchOverpassReverseRoad(env, lat, lon, ctx);
       const address = (reverse.address || {}) as Record<string, unknown>;
       
       let streetName: string | null = null;
       let subThoroughfare: string | null = null;
       
-      // Extract street name from Nominatim address
+      // Extract street name from the nearest Overpass road or address feature.
       if (address.road) {
         streetName = String(address.road);
       } else if (address.street) {
@@ -1643,7 +1694,7 @@ async function enrichIntersectionsWithAddresses(
     intersections.map(async (row, index) => {
       try {
         const sample = chooseIntersectionAddressSample(intersections, index);
-        const reverse = await fetchNominatimReverse(env, sample.lat, sample.lon, ctx);
+        const reverse = await fetchOverpassReverseRoad(env, sample.lat, sample.lon, ctx);
         const address = buildIntersectionAddressLabel(reverse, roadName);
         return {
           ...row,
@@ -3939,7 +3990,7 @@ async function resolveRoadBBox(
   focusPoint?: { lat: number; lon: number },
 ): Promise<{ bbox: BBox }> {
   // If a trusted focus point was provided by the caller (e.g. already geocoded on the client),
-  // derive a sensible bbox from it directly and skip the Nominatim round-trip.
+  // derive a sensible bbox from it directly and skip the extra Overpass road lookup.
   if (focusPoint && Number.isFinite(focusPoint.lat) && Number.isFinite(focusPoint.lon)) {
     const radius = 0.012;
     return {
@@ -3953,43 +4004,7 @@ async function resolveRoadBBox(
   }
 
   const normalizedCountry = /^[a-z]{2}$/.test(countryCode) ? countryCode : "";
-  let items: Array<Record<string, unknown>> = [];
-
-  if (normalizedCountry === "hk") {
-    const hkItems = await fetchNominatimSearch(roadName, "hk");
-    if (hkItems.length > 0) {
-      items = hkItems;
-    } else {
-      for (const q of [`香港${roadName}`, `Hong Kong ${roadName}`, roadName]) {
-        const cnItems = await fetchNominatimSearch(q, "cn");
-        if (cnItems.length > 0) {
-          items = cnItems;
-          break;
-        }
-      }
-    }
-  } else if (normalizedCountry) {
-    const queryVariants = buildQueryVariants(roadName);
-    for (const q of queryVariants) {
-      const filteredItems = await fetchNominatimSearch(q, normalizedCountry);
-      if (filteredItems.length > 0) {
-        items = filteredItems;
-        break;
-      }
-    }
-    // Fallback: try without country filter
-    if (!items.length) {
-      for (const q of queryVariants) {
-        const anyItems = await fetchNominatimSearch(q, "");
-        if (anyItems.length > 0) {
-          items = anyItems;
-          break;
-        }
-      }
-    }
-  } else {
-    items = await fetchNominatimSearch(roadName, "");
-  }
+  const items = await fetchOverpassRoadSearch(roadName, normalizedCountry);
 
   if (!items.length) {
     throw new Error(`Geocode no result for road name "${roadName}" (country: ${countryCode || "any"})`);
