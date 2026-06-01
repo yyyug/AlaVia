@@ -511,6 +511,7 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
   const body = await requireJson(request);
   const lat = Number(body.lat);
   const lon = Number(body.lon);
+  const heading = Number(body.heading);
   const countryCode = String(body.countryCode || "").trim().toLowerCase();
   validateCoordinates(lat, lon);
 
@@ -523,13 +524,19 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
   const address = (reverse.address || {}) as Record<string, unknown>;
   const resolvedCountry = countryCode || String(address.country_code || "").trim().toLowerCase();
 
-  const segmentData = await fetchSegmentData(env, ctx, roadName, resolvedCountry);
+  const segmentData = await fetchSegmentData(env, ctx, roadName, resolvedCountry, { lat, lon });
+  const nearestForwardIntersection = selectNearestForwardIntersection(
+    (segmentData.intersections || []) as IntersectionRow[],
+    { lat, lon },
+    Number.isFinite(heading) ? heading : null,
+  );
   return json({
     ...(segmentData as object),
     lat: round6(lat),
     lon: round6(lon),
     displayName: String(reverse.display_name || roadName),
     resolvedRoadName: roadName,
+    nearestForwardIntersection,
   });
 }
 
@@ -4936,6 +4943,35 @@ function resolveTurnCandidates(
 
 function turnCandidateScore(candidate: TurnCandidate): number {
   return Math.abs(90 - Math.abs(candidate.delta));
+}
+
+function selectNearestForwardIntersection(
+  intersections: IntersectionRow[],
+  origin: { lat: number; lon: number },
+  heading: number | null,
+): Json | null {
+  const candidates = intersections.map((intersection) => {
+    const bearing = Math.round(normalizeHeading(bearingDegrees(origin, intersection)));
+    const headingDelta = heading === null ? null : Math.round(signedBearingDelta(heading, bearing));
+    return {
+      ...intersection,
+      distanceMetersFromCurrent: Math.round(haversineMeters(origin, intersection)),
+      bearingFromCurrent: bearing,
+      directionFromCurrent: headingLabel(bearing),
+      headingDeltaFromCurrent: headingDelta,
+    };
+  });
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  const forwardCandidates = heading === null
+    ? candidates
+    : candidates.filter((candidate) => Math.abs(candidate.headingDeltaFromCurrent || 0) <= 90);
+  const pool = forwardCandidates.length ? forwardCandidates : candidates;
+  pool.sort((a, b) => a.distanceMetersFromCurrent - b.distanceMetersFromCurrent);
+  return pool[0];
 }
 
 function dedupeIntersections<T extends { id: number }>(

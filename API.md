@@ -60,6 +60,9 @@ All endpoints use JSON request/response unless noted.
   - Purpose: intersection list on a road segment
 - POST /api/intersections/near
   - Purpose: combined reverse + segment lookup
+  - Optional request field: `heading` in degrees
+  - Adds `nearestForwardIntersection`, including distance and bearing from the
+    requested position plus available left/right turn roads and angles
 - POST /api/intersections/address-batch
   - Purpose: reverse-address enrichment batch
   - Supports two request modes:
