@@ -4590,7 +4590,7 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
 
   const cached = await getOrCreateCached(
     env,
-    "streetview-indoor-entry-v2",
+    "streetview-indoor-entry-v3",
     cachePayload,
     async () => {
       const rings = [0, 30, 80, 140, radiusMeters].filter((d, i, arr) => arr.indexOf(d) === i);
@@ -4625,7 +4625,10 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
           checked += 1;
           const copyright = tilesMeta?.copyright || staticMeta?.copyright || null;
           const text = `${panoId} ${copyright || ""}`.toLowerCase();
-          const imageryType = tilesMeta?.imageryType || (hasIndoorHintText(text) ? "indoor" : "unknown");
+          const staticIndoor = staticMeta?.status === "OK"
+            ? await detectIndoorPanoramaLikely(mapsKey, staticMeta)
+            : false;
+          const imageryType = tilesMeta?.imageryType || (staticIndoor || hasIndoorHintText(text) ? "indoor" : "unknown");
           const indoor = imageryType === "indoor";
           const metaLat = tilesMeta?.lat ?? staticMeta?.lat ?? p.lat;
           const metaLon = tilesMeta?.lon ?? staticMeta?.lon ?? p.lon;
@@ -4649,14 +4652,16 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
       }
 
       scored.sort((a, b) => b.score - a.score || a.distanceMeters - b.distanceMeters);
-      const top = scored.slice(0, 3);
+      const top = scored.filter((item) => item.imageryType === "indoor").slice(0, 3);
 
       if (!top.length) {
         return {
           ok: true,
           found: false,
           checked,
-          error: "No nearby Street View panorama found",
+          error: scored.length
+            ? "Nearby Street View panoramas were found, but none could be verified as indoor"
+            : "No nearby Street View panorama found",
         } as Json;
       }
 

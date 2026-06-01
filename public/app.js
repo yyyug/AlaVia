@@ -841,7 +841,9 @@ async function refreshIndoorCandidatesAround(node, radiusMeters = 220) {
     lon: Number(node.lon),
     radiusMeters,
   });
-  const candidates = Array.isArray(entry?.candidates) ? entry.candidates : [];
+  const candidates = Array.isArray(entry?.candidates)
+    ? entry.candidates.filter((candidate) => candidate?.node?.imageryType === "indoor")
+    : [];
   await Promise.all(candidates.map((candidate) => hydrateIndoorNodeLinks(candidate?.node)));
   return candidates;
 }
@@ -891,6 +893,37 @@ function getBestIndoorMoveLink(links, bearing) {
   return bestDelta <= 55 ? { link: best, delta: Math.round(bestDelta) } : null;
 }
 
+function renderRelativeIndoorControls(facingHeading, links, onMove) {
+  const wrap = document.createElement("div");
+  wrap.className = "pano-links";
+  const copy = {
+    "zh-Hant": ["向前", "左轉", "右轉", "回頭"],
+    en: ["Forward", "Turn left", "Turn right", "Turn around"],
+    ja: ["前へ", "左折", "右折", "後ろへ"],
+    ko: ["앞으로", "좌회전", "우회전", "뒤로"],
+  }[state.uiLang] || ["向前", "左轉", "右轉", "回頭"];
+  const directions = [
+    { label: copy[0], offset: 0 },
+    { label: copy[1], offset: -90 },
+    { label: copy[2], offset: 90 },
+    { label: copy[3], offset: 180 },
+  ];
+
+  for (const direction of directions) {
+    const bearing = ((Number(facingHeading) + direction.offset) % 360 + 360) % 360;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "link-button";
+    const bestLink = getBestIndoorMoveLink(links, bearing);
+    btn.textContent = bestLink ? `${direction.label}：${formatIndoorLinkSummary(bestLink.link)}` : direction.label;
+    btn.addEventListener("click", async () => {
+      await onMove(bearing);
+    });
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
 function indoorImageryTypeLabel(type) {
   const labels = {
     "zh-Hant": { indoor: "仍在室內", outdoor: "將離開室內", unknown: "室內外狀態未確認" },
@@ -910,6 +943,8 @@ function indoorUiCopy() {
       exitWarning: "這一步會離開室內。是否繼續？",
       unknownWarning: "這一步的室內外狀態尚未確認。是否仍要繼續？",
       switchCandidate: "切換候選點",
+      indoorCandidateOnly: "此候選點未能確認為室內位置，不能作為室內候選點切換。",
+      hazardWarning: "此方向包含需要注意的設施：{hazards}。是否繼續？",
     },
     en: {
       approximately: "about",
@@ -917,6 +952,8 @@ function indoorUiCopy() {
       exitWarning: "This move leaves the indoor area. Continue?",
       unknownWarning: "The indoor/outdoor status of this move is unconfirmed. Continue anyway?",
       switchCandidate: "switch candidate",
+      indoorCandidateOnly: "This candidate is not verified as indoor and cannot be used as an indoor candidate.",
+      hazardWarning: "This direction includes facilities requiring attention: {hazards}. Continue?",
     },
     ja: {
       approximately: "約",
@@ -924,6 +961,8 @@ function indoorUiCopy() {
       exitWarning: "この移動で屋外に出ます。続行しますか？",
       unknownWarning: "この移動先の屋内外状態は未確認です。それでも続行しますか？",
       switchCandidate: "候補地点へ移動",
+      indoorCandidateOnly: "この候補地点は屋内と確認できないため、屋内候補として切り替えられません。",
+      hazardWarning: "この方向には注意が必要な設備があります：{hazards}。続行しますか？",
     },
     ko: {
       approximately: "약",
@@ -931,6 +970,8 @@ function indoorUiCopy() {
       exitWarning: "이 이동은 실외로 나갑니다. 계속하시겠습니까?",
       unknownWarning: "이 이동의 실내외 상태가 확인되지 않았습니다. 계속하시겠습니까?",
       switchCandidate: "후보 지점으로 이동",
+      indoorCandidateOnly: "이 후보 지점은 실내로 확인되지 않아 실내 후보로 전환할 수 없습니다.",
+      hazardWarning: "이 방향에는 주의가 필요한 시설이 있습니다: {hazards}. 계속하시겠습니까?",
     },
   };
   return copies[state.uiLang] || copies["zh-Hant"];
@@ -948,16 +989,34 @@ function formatIndoorLinkSummary(link) {
   return `${direction}，${formatIndoorLinkDistance(link)}，${description}，${indoorImageryTypeLabel(link?.targetImageryType)}`;
 }
 
+function getIndoorLinkHazards(link) {
+  const text = `${link?.label || ""} ${link?.description || ""}`.toLowerCase();
+  const hazards = [];
+  if (/樓梯|楼梯|階段|stair|계단/.test(text)) hazards.push("樓梯");
+  if (/扶梯|電扶梯|エスカレーター|escalator|에스컬레이터/.test(text)) hazards.push("扶手電梯");
+  if (/升降機|電梯|エレベーター|elevator|엘리베이터/.test(text)) hazards.push("升降機");
+  if (/月台|ホーム|platform|승강장/.test(text)) hazards.push("月台");
+  return [...new Set(hazards)];
+}
+
 function confirmIndoorTransition(link) {
-  if (!link?.requiresConfirmation && !link?.exitsIndoor) return true;
   const copy = indoorUiCopy();
-  const warning = link?.exitsIndoor ? copy.exitWarning : copy.unknownWarning;
-  return window.confirm(`${formatIndoorLinkSummary(link)}\n${warning}`);
+  const warnings = [];
+  if (link?.exitsIndoor) warnings.push(copy.exitWarning);
+  else if (link?.requiresConfirmation) warnings.push(copy.unknownWarning);
+  const hazards = getIndoorLinkHazards(link);
+  if (hazards.length) warnings.push(copy.hazardWarning.replace("{hazards}", hazards.join("、")));
+  if (!warnings.length) return true;
+  return window.confirm(`${formatIndoorLinkSummary(link)}\n${warnings.join("\n")}`);
 }
 
 function confirmIndoorCandidateTransition(currentNode, candidate) {
   const targetNode = candidate?.node || {};
   const targetImageryType = String(targetNode.imageryType || (targetNode.isIndoor ? "indoor" : "unknown"));
+  if (targetImageryType !== "indoor") {
+    window.alert(indoorUiCopy().indoorCandidateOnly);
+    return false;
+  }
   return confirmIndoorTransition({
     heading: candidate?.bearing,
     label: targetNode.addressLabel || indoorUiCopy().switchCandidate,
@@ -1013,11 +1072,16 @@ function summarizeIndoorCandidates(candidates, currentNode) {
 function buildIndoorMoveResultMessage(direction, meters, previousNode, nextNode, candidates) {
   const changed = previousNode?.panoId && nextNode?.panoId && previousNode.panoId !== nextNode.panoId;
   const status = changed ? t("indoorMoveChanged") : t("indoorMoveSame");
+  const previousType = String(previousNode?.imageryType || (previousNode?.isIndoor ? "indoor" : "unknown"));
+  const nextType = String(nextNode?.imageryType || (nextNode?.isIndoor ? "indoor" : "unknown"));
+  const environmentChange = previousType === nextType
+    ? indoorImageryTypeLabel(nextType)
+    : `${indoorImageryTypeLabel(previousType)} -> ${indoorImageryTypeLabel(nextType)}`;
   return `${tf("indoorMoveDone", { direction, meters })}\n${tf("indoorMoveResult", {
     status,
     provider: providerLabel(nextNode),
     candidates: summarizeIndoorCandidates(candidates, nextNode),
-  })}`;
+  })}\n${environmentChange}`;
 }
 
 function appendIndoorStatus(container, message) {
@@ -1400,6 +1464,10 @@ function renderIndoorNavigation(node, parentPanel) {
     container.appendChild(renderIndoorCandidateButtons(parentPanel));
   }
 
+  container.appendChild(renderRelativeIndoorControls(state.quickStreet.heading || 0, state.quickStreet.availableLinks, async (bearing) => {
+    await moveQuickIndoorByBearing(bearing, parentPanel);
+  }));
+
   const moveWrap = document.createElement("div");
   moveWrap.className = "pano-links";
   const stepDirections = [
@@ -1653,6 +1721,7 @@ async function moveQuickIndoorByBearing(bearing, parentPanel) {
   }
 
   state.quickStreet.nodeHistory.push(currentNode);
+  state.quickStreet.heading = bearing;
   state.quickStreet.currentNode = nextNode;
   state.quickStreet.availableLinks = nextNode.links || [];
   state.quickStreet.indoorCandidates = await refreshIndoorCandidatesAround(nextNode);
@@ -1707,6 +1776,7 @@ async function navigateToLink(link, parentPanel) {
       state.quickStreet.nodeHistory.push(state.quickStreet.currentNode);
     }
     state.quickStreet.currentNode = nextNode.node;
+    state.quickStreet.heading = Number(link.heading) || state.quickStreet.heading;
     state.quickStreet.availableLinks = nextNode.node.links || [];
     state.quickStreet.indoorCandidates = await refreshIndoorCandidatesAround(nextNode.node);
     state.quickStreet.selectedCandidateIndex = state.quickStreet.indoorCandidates.findIndex((c) => c?.node?.panoId === nextNode.node.panoId);
@@ -1788,7 +1858,14 @@ async function tryFindIndoorEntry(row, heading, panel) {
     return;
   }
 
-  const candidates = Array.isArray(entry.candidates) ? entry.candidates : [];
+  if (entry.node.imageryType !== "indoor") {
+    panel.classList.add("error");
+    panel.textContent = t("indoorNoEntry");
+    return;
+  }
+  const candidates = Array.isArray(entry.candidates)
+    ? entry.candidates.filter((candidate) => candidate?.node?.imageryType === "indoor")
+    : [];
   await hydrateIndoorNodeLinks(entry.node);
   await Promise.all(candidates.map((candidate) => hydrateIndoorNodeLinks(candidate?.node)));
 
@@ -2634,6 +2711,7 @@ function createCard(row, index, total) {
   let indoorHistory = [];
   let indoorCandidates = [];
   let selectedIndoorCandidate = -1;
+  let indoorHeading = row.bearingToNext ?? 0;
 
   const next = state.intersections[index + 1] || null;
   const routeOsmCacheKey = next
@@ -2830,6 +2908,7 @@ function createCard(row, index, total) {
       }
     }
 
+    const absoluteButtons = [];
     const stepDirections = [
       { bearing: 0, key: "dirN" },
       { bearing: 45, key: "dirNE" },
@@ -2924,6 +3003,7 @@ function createCard(row, index, total) {
         if (indoorNode?.panoId) {
           indoorHistory.push(indoorNode);
         }
+        indoorHeading = dir.bearing;
         indoorNode = {
           panoId: movedPano.panoId,
           lat: Number.isFinite(Number(movedPano.lat)) ? Number(movedPano.lat) : Number(indoorNode.lat),
@@ -2951,6 +3031,18 @@ function createCard(row, index, total) {
         updateQuickNavStatus(movedMsg);
       });
       controls.appendChild(btn);
+      absoluteButtons.push({ bearing: dir.bearing, button: btn });
+    }
+
+    const relativeControls = renderRelativeIndoorControls(indoorHeading, indoorNode?.links || [], async (bearing) => {
+      const closest = [...absoluteButtons].sort((a, b) =>
+        bearingDeltaAbs(bearing, a.bearing) - bearingDeltaAbs(bearing, b.bearing))[0];
+      closest?.button.click();
+    });
+    if (absoluteButtons.length) {
+      controls.insertBefore(relativeControls, absoluteButtons[0].button);
+    } else {
+      controls.appendChild(relativeControls);
     }
 
     return controls;
@@ -2997,7 +3089,12 @@ function createCard(row, index, total) {
 
       indoorNode = entry.node;
       indoorHistory = [];
-      indoorCandidates = Array.isArray(entry.candidates) ? entry.candidates : [];
+      if (entry.node.imageryType !== "indoor") {
+        throw new Error(t("indoorNoEntry"));
+      }
+      indoorCandidates = Array.isArray(entry.candidates)
+        ? entry.candidates.filter((candidate) => candidate?.node?.imageryType === "indoor")
+        : [];
       await hydrateIndoorNodeLinks(indoorNode);
       await Promise.all(indoorCandidates.map((candidate) => hydrateIndoorNodeLinks(candidate?.node)));
       selectedIndoorCandidate = indoorCandidates.findIndex((c) => c?.node?.panoId === entry.node.panoId);
