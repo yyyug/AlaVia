@@ -153,7 +153,10 @@ See [API.md](API.md) for complete endpoint documentation.
 - `POST /api/paid/streetview` - Get Street View images & AI descriptions (2 headings: left/right)
 - `POST /api/paid/places` - Get nearby landmarks from Google Places
 - `POST /api/osm/route-places` - Get OSM landmarks between two points
+- `POST /api/osm/indoor-graph` - Get a normalized OSM indoor navigation graph
+- `POST /api/indoor/graph` - Combine OSM indoor topology with Street View panorama links
 - `POST /api/streetview/metadata` - Check Street View coverage (free)
+- `POST /api/streetview/resolve-pano` - Resolve Street View Tiles metadata, real link distances, and indoor/outdoor transitions
 - `POST /api/admin/cleanup-noimage` - Remove no-coverage cache entries
 - `POST /api/admin/streetview-storage` - Query cache statistics
 

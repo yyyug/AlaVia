@@ -151,7 +151,15 @@ type StreetViewLink = {
   heading: number;
   description: string;
   label?: string;
+  distanceMeters?: number | null;
+  targetImageryType?: IndoorImageryType;
+  exitsIndoor?: boolean;
+  requiresConfirmation?: boolean;
+  targetLat?: number | null;
+  targetLon?: number | null;
 };
+
+type IndoorImageryType = "indoor" | "outdoor" | "unknown";
 
 type PanoNode = {
   panoId: string;
@@ -162,7 +170,41 @@ type PanoNode = {
   copyright?: string | null;
   date?: string | null;
   isIndoor: boolean;
+  imageryType?: IndoorImageryType;
+  addressLabel?: string | null;
+  reportProblemLink?: string | null;
   providerHint?: string | null;
+};
+
+type IndoorGraphNode = {
+  id: string;
+  lat: number;
+  lon: number;
+  kind: string;
+  label: string | null;
+  level: string | null;
+  source: "osm" | "streetview";
+  properties: Json;
+};
+
+type IndoorGraphEdge = {
+  id: string;
+  from: string;
+  to: string;
+  distanceMeters: number | null;
+  bearing: number | null;
+  kind: string;
+  level: string | null;
+  targetImageryType?: IndoorImageryType;
+  exitsIndoor?: boolean;
+  requiresConfirmation?: boolean;
+  source: "osm" | "streetview";
+  properties: Json;
+};
+
+type IndoorGraph = {
+  nodes: IndoorGraphNode[];
+  edges: IndoorGraphEdge[];
 };
 
 type LinkAnalysisResult = {
@@ -188,6 +230,10 @@ type IndoorStepDecision = {
     description: string;
     label: string;
     delta: number;
+    distanceMeters?: number | null;
+    targetImageryType?: IndoorImageryType;
+    exitsIndoor?: boolean;
+    requiresConfirmation?: boolean;
   };
   target?: { lat: number; lon: number };
 };
@@ -213,6 +259,8 @@ export default {
       { pathname: "/api/overpass/segment", method: "POST", handler: () => withErrorHandling(() => handleOverpassSegment(request, env, ctx)) },
       { pathname: "/api/intersections/near", method: "POST", handler: () => withErrorHandling(() => handleIntersectionsNear(request, env, ctx)) },
       { pathname: "/api/osm/tile", method: "POST", handler: () => withErrorHandling(() => handleOsmTile(request, env, ctx)) },
+      { pathname: "/api/osm/indoor-graph", method: "POST", handler: () => withErrorHandling(() => handleOsmIndoorGraph(request, env, ctx)) },
+      { pathname: "/api/indoor/graph", method: "POST", handler: () => withErrorHandling(() => handleUnifiedIndoorGraph(request, env, ctx)) },
       { pathname: "/api/osm/scan-nearby", method: "POST", handler: () => withErrorHandling(() => handleOsmScanNearby(request, env, ctx)) },
       { pathname: "/api/osm/places-around", method: "POST", handler: () => withErrorHandling(() => handleOsmPlacesAround(request, env, ctx)) },
       { pathname: "/api/paid/places", method: "POST", handler: () => withErrorHandling(() => handlePaidPlaces(request, env, ctx)) },
@@ -874,6 +922,211 @@ async function handleOsmTile(request: Request, env: Env, ctx: ExecutionContext):
   return json({ ok: true, ...tile });
 }
 
+async function handleOsmIndoorGraph(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(40, Math.min(500, Number(body.radiusMeters ?? 220)));
+
+  validateCoordinates(lat, lon);
+
+  const cached = await getOrCreateCached(
+    env,
+    "osm-indoor-graph-v1",
+    { lat: round5(lat), lon: round5(lon), radiusMeters },
+    async () => {
+      const result = await fetchOverpassPlaceJson(buildOsmIndoorGraphQuery(lat, lon, radiusMeters));
+      return {
+        ok: true,
+        lat: round6(lat),
+        lon: round6(lon),
+        radiusMeters,
+        endpoint: result.endpoint,
+        graph: buildOsmIndoorGraph(result.data),
+      } as Json;
+    },
+    OSM_CACHE_TTL_SECONDS,
+    { ctx, staleWhileRevalidateSeconds: OSM_CACHE_STALE_SECONDS },
+  );
+
+  return json(cached.data);
+}
+
+async function handleUnifiedIndoorGraph(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(40, Math.min(500, Number(body.radiusMeters ?? 220)));
+  const panoId = String(body.panoId || "").trim() || null;
+
+  validateCoordinates(lat, lon);
+  const mapsKey = requireGoogleMapsKey(env);
+  const cached = await getOrCreateCached(
+    env,
+    "unified-indoor-graph-v1",
+    { lat: round5(lat), lon: round5(lon), radiusMeters, panoId },
+    async () => {
+      const osmResult = await fetchOverpassPlaceJson(buildOsmIndoorGraphQuery(lat, lon, radiusMeters));
+      const osmGraph = buildOsmIndoorGraph(osmResult.data);
+      const streetViewNode = await resolveStreetViewPanoNode(mapsKey, { panoId, lat, lon, radiusMeters: 50 });
+      const streetViewGraph = streetViewNode ? buildStreetViewIndoorGraph(streetViewNode) : { nodes: [], edges: [] };
+      return {
+        ok: true,
+        lat: round6(lat),
+        lon: round6(lon),
+        radiusMeters,
+        graph: mergeIndoorGraphs(osmGraph, streetViewGraph),
+        currentStreetViewNode: streetViewNode,
+      } as Json;
+    },
+    15 * 60,
+    { ctx, staleWhileRevalidateSeconds: 5 * 60 },
+  );
+
+  return json(cached.data);
+}
+
+function mergeIndoorGraphs(...graphs: IndoorGraph[]): IndoorGraph {
+  const nodes = new Map<string, IndoorGraphNode>();
+  const edges = new Map<string, IndoorGraphEdge>();
+  for (const graph of graphs) {
+    for (const node of graph.nodes) nodes.set(node.id, node);
+    for (const edge of graph.edges) edges.set(edge.id, edge);
+  }
+  return { nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+
+function buildOsmIndoorGraphQuery(lat: number, lon: number, radiusMeters: number): string {
+  const around = `(around:${radiusMeters},${lat},${lon})`;
+  return `
+[out:json][timeout:25];
+(
+  way["indoor"]${around};
+  way["highway"~"corridor|footway|steps|elevator"]${around};
+  node["indoor"]${around};
+  node["entrance"]${around};
+  node["highway"~"elevator|steps"]${around};
+  node["railway"~"subway_entrance|station|platform"]${around};
+  node["public_transport"~"platform|station|stop_position"]${around};
+);
+(._;>;);
+out body geom;
+`;
+}
+
+function buildOsmIndoorGraph(overpass: Json): IndoorGraph {
+  const elements = Array.isArray(overpass.elements) ? (overpass.elements as Json[]) : [];
+  const nodeById = new Map<number, { lat: number; lon: number; tags: Json }>();
+  const ways: Array<{ id: number; nodes: number[]; tags: Json }> = [];
+
+  for (const element of elements) {
+    const type = String(element.type || "");
+    if (type === "node") {
+      const id = Number(element.id);
+      const lat = Number(element.lat);
+      const lon = Number(element.lon);
+      if (Number.isFinite(id) && Number.isFinite(lat) && Number.isFinite(lon)) {
+        nodeById.set(id, { lat, lon, tags: (element.tags || {}) as Json });
+      }
+    } else if (type === "way") {
+      ways.push({
+        id: Number(element.id),
+        nodes: Array.isArray(element.nodes) ? (element.nodes as number[]) : [],
+        tags: (element.tags || {}) as Json,
+      });
+    }
+  }
+
+  const graphNodes = new Map<string, IndoorGraphNode>();
+  const edges: IndoorGraphEdge[] = [];
+  const ensureNode = (id: number, tags: Json = {}): IndoorGraphNode | null => {
+    const point = nodeById.get(id);
+    if (!point) return null;
+    const key = `osm-node:${id}`;
+    const existing = graphNodes.get(key);
+    if (existing) return existing;
+    const mergedTags = Object.keys(tags).length ? tags : point.tags;
+    const node: IndoorGraphNode = {
+      id: key,
+      lat: round6(point.lat),
+      lon: round6(point.lon),
+      kind: classifyOsmIndoorFeature(mergedTags),
+      label: extractOsmIndoorLabel(mergedTags),
+      level: extractOsmLevel(mergedTags),
+      source: "osm",
+      properties: mergedTags,
+    };
+    graphNodes.set(key, node);
+    return node;
+  };
+
+  for (const [id, point] of nodeById) {
+    if (Object.keys(point.tags).length) {
+      ensureNode(id, point.tags);
+    }
+  }
+
+  for (const way of ways) {
+    const kind = classifyOsmIndoorFeature(way.tags);
+    const level = extractOsmLevel(way.tags);
+    for (let index = 0; index < way.nodes.length - 1; index += 1) {
+      const from = ensureNode(way.nodes[index], way.tags);
+      const to = ensureNode(way.nodes[index + 1], way.tags);
+      if (!from || !to) continue;
+      const distanceMeters = Math.round(haversineMeters(from, to));
+      const bearing = Math.round(bearingDegrees(from, to));
+      const properties = { ...way.tags, osmWayId: way.id };
+      edges.push({
+        id: `osm-way:${way.id}:${index}:forward`,
+        from: from.id,
+        to: to.id,
+        distanceMeters,
+        bearing,
+        kind,
+        level,
+        source: "osm",
+        properties,
+      });
+      edges.push({
+        id: `osm-way:${way.id}:${index}:reverse`,
+        from: to.id,
+        to: from.id,
+        distanceMeters,
+        bearing: Math.round(normalizeHeading(bearing + 180)),
+        kind,
+        level,
+        source: "osm",
+        properties,
+      });
+    }
+  }
+
+  return { nodes: [...graphNodes.values()], edges };
+}
+
+function classifyOsmIndoorFeature(tags: Json): string {
+  const highway = String(tags.highway || "").trim();
+  const indoor = String(tags.indoor || "").trim();
+  const railway = String(tags.railway || "").trim();
+  const publicTransport = String(tags.public_transport || "").trim();
+  if (highway === "elevator") return "elevator";
+  if (highway === "steps") return "stairs";
+  if (String(tags.entrance || "").trim()) return "entrance";
+  if (railway === "subway_entrance") return "station_entrance";
+  if (railway === "platform" || publicTransport === "platform") return "platform";
+  if (indoor === "corridor" || highway === "corridor") return "corridor";
+  if (indoor) return indoor;
+  return highway || railway || publicTransport || "indoor_path";
+}
+
+function extractOsmIndoorLabel(tags: Json): string | null {
+  return String(tags["name:zh"] || tags.name || tags.ref || tags["level:ref"] || "").trim() || null;
+}
+
+function extractOsmLevel(tags: Json): string | null {
+  return String(tags["level:ref"] || tags.level || "").trim() || null;
+}
+
 async function handleOsmScanNearby(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await requireJson(request);
   const lat = Number(body.lat);
@@ -961,10 +1214,13 @@ function buildOsmTileQuery(bbox: BBox): string {
 (
   way["highway"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["highway"="crossing"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["highway"~"elevator|steps"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["entrance"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  node["indoor"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["amenity"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["shop"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   node["tourism"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
+  way["indoor"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
   way["building"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
 );
 out body geom;
@@ -1017,6 +1273,25 @@ function buildTileFeatures(parsed: ParsedOverpass, bbox: BBox): Json[] {
       osm_ids: [way.id],
       feature_type: "highway",
       feature_value: String(way.tags.highway || "road"),
+      geometry: { type: "LineString", coordinates: coords },
+      properties: way.tags,
+    } as Json);
+  }
+
+  const indoorWays = parsed.ways.filter((way) =>
+    String(way.tags.indoor || "").trim().length > 0
+    && String(way.tags.highway || "").trim().length === 0);
+  for (const way of indoorWays) {
+    const coords = way.nodes
+      .map((id) => parsed.nodes.get(id))
+      .filter(Boolean)
+      .map((n) => [round6((n as { lon: number }).lon), round6((n as { lat: number }).lat)]);
+    if (coords.length < 2) continue;
+    features.push({
+      type: "Feature",
+      osm_ids: [way.id],
+      feature_type: "indoor",
+      feature_value: String(way.tags.indoor || "path"),
       geometry: { type: "LineString", coordinates: coords },
       properties: way.tags,
     } as Json);
@@ -1142,12 +1417,14 @@ function findNearbyEntrances(
 function hasInterestingTileTags(tags: Json): boolean {
   return Boolean(
     tags.amenity || tags.shop || tags.tourism ||
-    tags["public_transport"] || tags.railway || tags.highway === "crossing",
+    tags["public_transport"] || tags.railway || tags.indoor ||
+    tags.entrance || tags.highway === "crossing" || tags.highway === "elevator" || tags.highway === "steps",
   );
 }
 
 function tileFeatureTypeForTags(tags: Json): string {
   if (tags.amenity || tags.shop || tags.tourism) return "place";
+  if (tags.indoor || tags.highway === "elevator" || tags.highway === "steps") return "indoor";
   if (tags.railway || tags["public_transport"]) return "transit";
   if (tags.highway === "crossing") return "crossing";
   return "place";
@@ -2762,7 +3039,9 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
     });
   }
 
-  const indoorLikely = panoId ? await detectIndoorPanoramaLikelyByPanoId(mapsKey, panoId) : await detectIndoorPanoramaLikely(mapsKey, metadata);
+  const tilesMeta = await fetchStreetViewTilesMetadata(mapsKey, panoId ? { panoId } : { lat: metadata.lat, lon: metadata.lon });
+  const indoorLikely = tilesMeta?.imageryType === "indoor"
+    || (panoId ? await detectIndoorPanoramaLikelyByPanoId(mapsKey, panoId) : await detectIndoorPanoramaLikely(mapsKey, metadata));
 
   const views = [
     { label: "前方", heading: normalizeHeading(heading + 0) },
@@ -2894,6 +3173,9 @@ async function handlePaidStreetView(request: Request, env: Env, ctx: ExecutionCo
       heading: normalizeHeading(heading),
       copyright: metadata.copyright,
       date: metadata.date,
+      imageryType: tilesMeta?.imageryType || (indoorLikely ? "indoor" : "unknown"),
+      addressLabel: tilesMeta?.addressLabel || null,
+      reportProblemLink: tilesMeta?.reportProblemLink || null,
       providerHint: extractProviderFromCopyright(metadata.copyright),
     },
     scenes,
@@ -3572,6 +3854,168 @@ async function fetchStreetViewMetadataDetails(apiKey: string, lat: number, lon: 
   }
 }
 
+type StreetViewTilesMetadata = {
+  panoId: string;
+  lat: number;
+  lon: number;
+  imageryType: IndoorImageryType;
+  date: string | null;
+  copyright: string | null;
+  reportProblemLink: string | null;
+  addressLabel: string | null;
+  links: Array<{ panoId: string; heading: number; text: string }>;
+};
+
+let streetViewTilesSession: { apiKey: string; session: string; expiry: number } | null = null;
+
+async function getStreetViewTilesSession(apiKey: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  if (streetViewTilesSession?.apiKey === apiKey && streetViewTilesSession.expiry > now + 300) {
+    return streetViewTilesSession.session;
+  }
+
+  const res = await fetchWithTimeout(
+    `https://tile.googleapis.com/v1/createSession?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mapType: "streetview", language: "zh-TW", region: "TW" }),
+    },
+    8000,
+  );
+  const body = (await res.json().catch(() => ({}))) as Json;
+  if (!res.ok || !String(body.session || "").trim()) {
+    throw new Error(extractGoogleErrorMessage(body) || `Map Tiles session HTTP ${res.status}`);
+  }
+
+  streetViewTilesSession = {
+    apiKey,
+    session: String(body.session),
+    expiry: Number(body.expiry) || now + 3600,
+  };
+  return streetViewTilesSession.session;
+}
+
+async function fetchStreetViewTilesMetadata(
+  apiKey: string,
+  query: { panoId?: string | null; lat?: number; lon?: number; radiusMeters?: number },
+): Promise<StreetViewTilesMetadata | null> {
+  try {
+    const session = await getStreetViewTilesSession(apiKey);
+    const params = new URLSearchParams({ session, key: apiKey });
+    if (query.panoId) {
+      params.set("panoId", query.panoId);
+    } else if (Number.isFinite(query.lat) && Number.isFinite(query.lon)) {
+      params.set("lat", String(query.lat));
+      params.set("lng", String(query.lon));
+      params.set("radius", String(Math.max(1, Math.min(100, Number(query.radiusMeters ?? 50)))));
+    } else {
+      return null;
+    }
+
+    const res = await fetchWithTimeout(`https://tile.googleapis.com/v1/streetview/metadata?${params.toString()}`, {}, 8000);
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => ({}))) as Json;
+    const panoId = String(body.panoId || "").trim();
+    const lat = Number(body.lat);
+    const lon = Number(body.lng);
+    if (!panoId || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+    const addressComponents = Array.isArray(body.addressComponents) ? (body.addressComponents as Json[]) : [];
+    const addressLabel = addressComponents
+      .map((component) => String(component.longName || component.shortName || "").trim())
+      .filter(Boolean)
+      .reverse()
+      .join(" ");
+    const links = Array.isArray(body.links) ? (body.links as Json[]) : [];
+
+    return {
+      panoId,
+      lat,
+      lon,
+      imageryType: normalizeIndoorImageryType(body.imageryType),
+      date: String(body.date || "").trim() || null,
+      copyright: String(body.copyright || "").trim() || null,
+      reportProblemLink: String(body.reportProblemLink || "").trim() || null,
+      addressLabel: addressLabel || null,
+      links: links
+        .map((link) => ({
+          panoId: String(link.panoId || "").trim(),
+          heading: Number(link.heading),
+          text: String(link.text || "").trim(),
+        }))
+        .filter((link) => link.panoId && Number.isFinite(link.heading)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeIndoorImageryType(value: unknown): IndoorImageryType {
+  const type = String(value || "").trim().toLowerCase();
+  return type === "indoor" || type === "outdoor" ? type : "unknown";
+}
+
+async function resolveStreetViewPanoNode(
+  apiKey: string,
+  query: { panoId?: string | null; lat?: number; lon?: number; radiusMeters?: number },
+): Promise<PanoNode | null> {
+  const tilesMeta = await fetchStreetViewTilesMetadata(apiKey, query);
+  if (tilesMeta) {
+    const links = await Promise.all(tilesMeta.links.map(async (link) => {
+      const target = await fetchStreetViewTilesMetadata(apiKey, { panoId: link.panoId });
+      const distanceMeters = target ? Math.round(haversineMeters(tilesMeta, target)) : null;
+      const exitsIndoor = tilesMeta.imageryType === "indoor" && target?.imageryType === "outdoor";
+      return {
+        panoId: link.panoId,
+        heading: link.heading,
+        description: link.text,
+        label: link.text || "前往",
+        distanceMeters,
+        targetImageryType: target?.imageryType || "unknown",
+        exitsIndoor,
+        requiresConfirmation: exitsIndoor || target?.imageryType === "unknown",
+        targetLat: target?.lat ?? null,
+        targetLon: target?.lon ?? null,
+      } satisfies StreetViewLink;
+    }));
+
+    return {
+      panoId: tilesMeta.panoId,
+      lat: round6(tilesMeta.lat),
+      lon: round6(tilesMeta.lon),
+      levelLabel: null,
+      links,
+      copyright: tilesMeta.copyright,
+      date: tilesMeta.date,
+      isIndoor: tilesMeta.imageryType === "indoor",
+      imageryType: tilesMeta.imageryType,
+      addressLabel: tilesMeta.addressLabel,
+      reportProblemLink: tilesMeta.reportProblemLink,
+      providerHint: extractProviderFromCopyright(tilesMeta.copyright),
+    };
+  }
+
+  if (!Number.isFinite(query.lat) || !Number.isFinite(query.lon)) return null;
+  const meta = await fetchStreetViewMetadataDetails(apiKey, Number(query.lat), Number(query.lon));
+  if (meta.status !== "OK" || !meta.panoId) return null;
+  const isIndoor = await detectIndoorPanoramaLikely(apiKey, meta);
+  return {
+    panoId: meta.panoId,
+    lat: round6(meta.lat),
+    lon: round6(meta.lon),
+    levelLabel: null,
+    links: [],
+    copyright: meta.copyright,
+    date: meta.date,
+    isIndoor,
+    imageryType: isIndoor ? "indoor" : "unknown",
+    addressLabel: null,
+    reportProblemLink: null,
+    providerHint: extractProviderFromCopyright(meta.copyright),
+  };
+}
+
 async function detectIndoorPanoramaLikely(apiKey: string, meta: StreetViewMetadataDetails): Promise<boolean> {
   const sourceText = `${meta.copyright || ""} ${meta.panoId || ""}`.toLowerCase();
   const vendorIndoorHints = ["metro", "station", "mall", "airport", "jr", "rail", "terminal", "subway"];
@@ -4057,72 +4501,75 @@ async function handleResolveStreetViewPano(request: Request, env: Env): Promise<
   }
 
   const mapsKey = requireGoogleMapsKey(env);
-  
-  let resolvedLat = lat;
-  let resolvedLon = lon;
-  let resolvedPanoId = panoId;
-  let copyright: string | null = null;
-  let date: string | null = null;
-
-  // If no panoId, resolve from coordinates first
-  if (!resolvedPanoId) {
-    const meta = await fetchStreetViewMetadataDetails(mapsKey, round6(lat), round6(lon));
-    if (meta.status !== "OK") {
-      return json({
-        ok: false,
-        error: `No Street View at ${lat},${lon}: ${meta.status}`,
-      });
-    }
-    resolvedPanoId = meta.panoId;
-    resolvedLat = meta.lat;
-    resolvedLon = meta.lon;
-    copyright = meta.copyright;
-    date = meta.date;
-  } else {
-    // If panoId provided, still fetch metadata to get coordinates
-    const meta = await fetchStreetViewMetadataDetails(mapsKey, round6(lat || 0), round6(lon || 0));
-    if (meta.panoId === resolvedPanoId) {
-      resolvedLat = meta.lat;
-      resolvedLon = meta.lon;
-      copyright = meta.copyright;
-      date = meta.date;
-    }
-  }
-
-  if (!resolvedPanoId) {
+  const node = await resolveStreetViewPanoNode(mapsKey, {
+    panoId,
+    lat: Number.isFinite(lat) ? round6(lat) : undefined,
+    lon: Number.isFinite(lon) ? round6(lon) : undefined,
+  });
+  if (!node) {
     return json({
       ok: false,
-      error: "Could not resolve pano ID",
+      error: "Could not resolve Street View panorama",
     });
   }
-
-  // For now, return basic pano info without real links (since Metadata API doesn't expose links directly)
-  // In a production system, you'd use JS API on frontend to get links, or store them separately
-  const isIndoor = await detectIndoorPanoramaLikely(mapsKey, {
-    status: "OK",
-    panoId: resolvedPanoId,
-    lat: resolvedLat,
-    lon: resolvedLon,
-    copyright,
-    date,
-  });
-
-  const node: PanoNode = {
-    panoId: resolvedPanoId,
-    lat: resolvedLat,
-    lon: resolvedLon,
-    levelLabel: null,
-    links: [], // Will be populated by frontend using JS API
-    copyright,
-    date,
-    isIndoor,
-    providerHint: extractProviderFromCopyright(copyright),
-  };
 
   return json({
     ok: true,
     node,
+    graph: buildStreetViewIndoorGraph(node),
   });
+}
+
+function buildStreetViewIndoorGraph(node: PanoNode): IndoorGraph {
+  const rootId = `streetview:${node.panoId}`;
+  const nodes: IndoorGraphNode[] = [{
+    id: rootId,
+    lat: round6(node.lat),
+    lon: round6(node.lon),
+    kind: node.imageryType || "unknown",
+    label: node.addressLabel || null,
+    level: node.levelLabel || null,
+    source: "streetview",
+    properties: {
+      panoId: node.panoId,
+      imageryType: node.imageryType || "unknown",
+      providerHint: node.providerHint || null,
+      date: node.date || null,
+    },
+  }];
+  const edges: IndoorGraphEdge[] = [];
+
+  for (const link of node.links) {
+    const targetId = `streetview:${link.panoId}`;
+    if (Number.isFinite(link.targetLat) && Number.isFinite(link.targetLon)) {
+      nodes.push({
+        id: targetId,
+        lat: round6(Number(link.targetLat)),
+        lon: round6(Number(link.targetLon)),
+        kind: link.targetImageryType || "unknown",
+        label: link.description || null,
+        level: null,
+        source: "streetview",
+        properties: { panoId: link.panoId, imageryType: link.targetImageryType || "unknown" },
+      });
+    }
+    edges.push({
+      id: `${rootId}->${targetId}`,
+      from: rootId,
+      to: targetId,
+      distanceMeters: link.distanceMeters ?? null,
+      bearing: Math.round(normalizeHeading(link.heading)),
+      kind: "panorama_link",
+      level: null,
+      targetImageryType: link.targetImageryType || "unknown",
+      exitsIndoor: link.exitsIndoor === true,
+      requiresConfirmation: link.requiresConfirmation === true,
+      source: "streetview",
+      properties: { description: link.description || "", label: link.label || "" },
+    });
+  }
+
+  return { nodes, edges };
 }
 
 async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4156,6 +4603,7 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
         lat: number;
         lon: number;
         indoor: boolean;
+        imageryType: IndoorImageryType;
         copyright: string | null;
         date: string | null;
         providerHint: string | null;
@@ -4168,27 +4616,34 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
           ring === 0 ? [origin] : headings.map((h) => offsetPointByMeters(origin, normalizeHeading(h), ring));
 
         for (const p of points) {
-          const meta = await fetchStreetViewMetadataDetails(mapsKey, round6(p.lat), round6(p.lon));
-          if (meta.status !== "OK" || !meta.panoId || seen.has(meta.panoId)) continue;
-          seen.add(meta.panoId);
+          const tilesMeta = await fetchStreetViewTilesMetadata(mapsKey, { lat: round6(p.lat), lon: round6(p.lon), radiusMeters: 50 });
+          const staticMeta = tilesMeta ? null : await fetchStreetViewMetadataDetails(mapsKey, round6(p.lat), round6(p.lon));
+          const panoId = tilesMeta?.panoId || staticMeta?.panoId || null;
+          if (!panoId || seen.has(panoId) || (!tilesMeta && staticMeta?.status !== "OK")) continue;
+          seen.add(panoId);
 
           checked += 1;
-          const text = `${meta.panoId || ""} ${meta.copyright || ""}`.toLowerCase();
-          const indoor = hasIndoorHintText(text);
-          const actualDistance = Math.round(haversineMeters(origin, { lat: meta.lat, lon: meta.lon }));
+          const copyright = tilesMeta?.copyright || staticMeta?.copyright || null;
+          const text = `${panoId} ${copyright || ""}`.toLowerCase();
+          const imageryType = tilesMeta?.imageryType || (hasIndoorHintText(text) ? "indoor" : "unknown");
+          const indoor = imageryType === "indoor";
+          const metaLat = tilesMeta?.lat ?? staticMeta?.lat ?? p.lat;
+          const metaLon = tilesMeta?.lon ?? staticMeta?.lon ?? p.lon;
+          const actualDistance = Math.round(haversineMeters(origin, { lat: metaLat, lon: metaLon }));
           const stationBonus = hasStationHintText(text) ? 200 : 0;
           const score = (indoor ? 1000 : 0) + stationBonus - actualDistance;
 
           scored.push({
             score,
             distanceMeters: actualDistance,
-            panoId: meta.panoId,
-            lat: meta.lat,
-            lon: meta.lon,
+            panoId,
+            lat: metaLat,
+            lon: metaLon,
             indoor,
-            copyright: meta.copyright,
-            date: meta.date,
-            providerHint: extractProviderFromCopyright(meta.copyright),
+            imageryType,
+            copyright,
+            date: tilesMeta?.date || staticMeta?.date || null,
+            providerHint: extractProviderFromCopyright(copyright),
           });
         }
       }
@@ -4210,6 +4665,7 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
         lat: number;
         lon: number;
         indoor: boolean;
+        imageryType: IndoorImageryType;
         copyright: string | null;
         date: string | null;
         providerHint: string | null;
@@ -4222,19 +4678,22 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
         copyright: item.copyright,
         date: item.date,
         isIndoor: item.indoor,
+        imageryType: item.imageryType,
         providerHint: item.providerHint,
       });
 
       const best = top[0];
       const second = top[1] || null;
       const confidence = estimateIndoorEntryConfidence(best, second);
-      const node = toNode(best);
+      const node = await resolveStreetViewPanoNode(mapsKey, { panoId: best.panoId, lat: best.lat, lon: best.lon }) || toNode(best);
+      const candidateNodes = await Promise.all(top.map(async (item) =>
+        await resolveStreetViewPanoNode(mapsKey, { panoId: item.panoId, lat: item.lat, lon: item.lon }) || toNode(item)));
       const candidates = top.map((item, index) => ({
         rank: index + 1,
         distanceMeters: item.distanceMeters,
         indoor: item.indoor,
         score: item.score,
-        node: toNode(item),
+        node: candidateNodes[index],
         bearing: Math.round(calculateBearing(lat, lon, item.lat, item.lon)),
       }));
 
@@ -4250,8 +4709,8 @@ async function handleFindNearbyIndoorEntry(request: Request, env: Env, ctx: Exec
         candidates,
       } as Json;
     },
-    30 * DAY,
-    { ctx, staleWhileRevalidateSeconds: 7 * DAY },
+    15 * 60,
+    { ctx, staleWhileRevalidateSeconds: 5 * 60 },
   );
 
   return json(cached.data);
@@ -4271,6 +4730,10 @@ async function handleIndoorStepDecision(request: Request): Promise<Response> {
       heading: Number(it.heading),
       description: String(it.description || "").trim(),
       label: String(it.label || "").trim(),
+      distanceMeters: Number.isFinite(Number(it.distanceMeters)) ? Number(it.distanceMeters) : null,
+      targetImageryType: normalizeIndoorImageryType(it.targetImageryType),
+      exitsIndoor: it.exitsIndoor === true,
+      requiresConfirmation: it.requiresConfirmation === true,
     }))
     .filter((it) => it.panoId && Number.isFinite(it.heading));
 
@@ -4298,6 +4761,10 @@ async function handleIndoorStepDecision(request: Request): Promise<Response> {
         description: best.description,
         label: best.label || best.description || "前往",
         delta: Math.round(bestDelta),
+        distanceMeters: best.distanceMeters,
+        targetImageryType: best.targetImageryType,
+        exitsIndoor: best.exitsIndoor,
+        requiresConfirmation: best.requiresConfirmation,
       },
     };
     return json({ ok: true, decision });

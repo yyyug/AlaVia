@@ -16,6 +16,7 @@ This file is the single source of truth for AlaVia backend architecture, API con
   - OpenStreetMap Overpass (road search/reverse-road lookup)
   - OpenStreetMap Overpass
   - Google Maps APIs (Street View, Places)
+  - Google Map Tiles API (Street View metadata enrichment)
   - Gemini API (text generation)
 
 ### Cache Model
@@ -95,6 +96,11 @@ All endpoints use JSON request/response unless noted.
   - Purpose: SoundScape-compatible tile endpoint
   - Source priority: R2 hot cache -> PMTiles -> Neon/PostGIS -> Overpass -> empty tile
 - POST /api/osm/tile
+- POST /api/osm/indoor-graph
+  - Purpose: normalized OSM indoor `nodes` / `edges` graph
+  - Includes corridors, entrances, elevators, stairs, platforms, levels, and preserved OSM properties
+- POST /api/indoor/graph
+  - Purpose: unified indoor graph combining nearby OSM topology and the current Street View panorama links
 - POST /api/osm/scan-nearby
 - POST /api/osm/places-around
 - POST /api/osm/route-places
@@ -108,6 +114,8 @@ All endpoints use JSON request/response unless noted.
 - POST /api/paid/route-scenery
 - POST /api/streetview/metadata
 - POST /api/streetview/resolve-pano
+  - Uses Street View Tiles metadata when available, with the existing Static API path as fallback
+  - Returns `imageryType`, address, report link, and enriched links with real distance and exit-confirmation flags
 - POST /api/streetview/find-indoor-entry
 - POST /api/streetview/indoor-step
 - POST /api/streetview/analyze-link
