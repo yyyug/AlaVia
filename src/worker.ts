@@ -90,6 +90,16 @@ type IntersectionRow = {
   leftTurn: TurnCandidate | null;
   rightTurn: TurnCandidate | null;
 };
+type PreviewGraphEdge = {
+  from: number;
+  to: number;
+  distanceMeters: number;
+  bearing: number;
+};
+type PreviewGraph = {
+  edges: PreviewGraphEdge[];
+  nodes: Record<string, { lat: number; lon: number }>;
+};
 type OsmPlaceCandidate = {
   id: string;
   lat: number;
@@ -502,7 +512,7 @@ async function handleOverpassSegment(request: Request, env: Env, ctx: ExecutionC
     ? { lat: focusLat, lon: focusLon }
     : undefined;
   const data = await fetchSegmentData(env, ctx, roadName, countryCode, focusPoint);
-  return json(data);
+  return json(withoutPreviewGraph(data));
 }
 
 // Combined endpoint: reverse-geocode lat/lon then return segment intersections in one round-trip.
@@ -511,6 +521,7 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
   const body = await requireJson(request);
   const lat = Number(body.lat);
   const lon = Number(body.lon);
+  const heading = Number(body.heading);
   const countryCode = String(body.countryCode || "").trim().toLowerCase();
   validateCoordinates(lat, lon);
 
@@ -523,13 +534,19 @@ async function handleIntersectionsNear(request: Request, env: Env, ctx: Executio
   const address = (reverse.address || {}) as Record<string, unknown>;
   const resolvedCountry = countryCode || String(address.country_code || "").trim().toLowerCase();
 
-  const segmentData = await fetchSegmentData(env, ctx, roadName, resolvedCountry);
+  const segmentData = await fetchSegmentData(env, ctx, roadName, resolvedCountry, { lat, lon });
+  const nearestForwardIntersection = selectPreviewForwardIntersection(
+    segmentData,
+    { lat, lon },
+    Number.isFinite(heading) ? heading : null,
+  );
   return json({
-    ...(segmentData as object),
+    ...(withoutPreviewGraph(segmentData) as object),
     lat: round6(lat),
     lon: round6(lon),
     displayName: String(reverse.display_name || roadName),
     resolvedRoadName: roadName,
+    nearestForwardIntersection,
   });
 }
 
@@ -542,12 +559,13 @@ async function fetchSegmentData(
   focusPoint?: { lat: number; lon: number },
 ): Promise<Json> {
   await ensureD1Schema(env);
-  // Cache key uses only normalized road name — no bbox — so repeated queries for
-  // the same road always hit the same cache entry regardless of Nominatim variance.
+  // Position-aware cells prevent long or repeated road names from reusing a
+  // segment graph captured too far away from the current location.
   const cachePayload = {
     roadName: normalizeRoadName(roadName),
     countryCode,
-    version: 5,
+    focusCell: focusPoint ? `${round4(focusPoint.lat)},${round4(focusPoint.lon)}` : "",
+    version: 6,
   };
 
   const cached = await getOrCreateCached(
@@ -780,6 +798,7 @@ async function fetchSegmentData(
           addressLabel: null,
           addressSource: null,
         })),
+        _previewGraph: buildPreviewGraph(targetWays, nodes),
         warning,
         diagnostics: {
           endpoint: overpassResult.endpoint,
@@ -4936,6 +4955,138 @@ function resolveTurnCandidates(
 
 function turnCandidateScore(candidate: TurnCandidate): number {
   return Math.abs(90 - Math.abs(candidate.delta));
+}
+
+function withoutPreviewGraph(data: Json): Json {
+  const { _previewGraph: _ignored, ...publicData } = data;
+  return publicData;
+}
+
+function buildPreviewGraph(
+  ways: Way[],
+  nodes: Map<number, { id: number; lat: number; lon: number; tags: Json }>,
+): PreviewGraph {
+  const edges: PreviewGraphEdge[] = [];
+  const graphNodes: Record<string, { lat: number; lon: number }> = {};
+
+  for (const way of ways) {
+    for (let index = 0; index < way.nodes.length - 1; index += 1) {
+      const from = nodes.get(way.nodes[index]);
+      const to = nodes.get(way.nodes[index + 1]);
+      if (!from || !to) continue;
+      graphNodes[String(from.id)] = { lat: from.lat, lon: from.lon };
+      graphNodes[String(to.id)] = { lat: to.lat, lon: to.lon };
+      const distanceMeters = haversineMeters(from, to);
+      const bearing = normalizeHeading(bearingDegrees(from, to));
+      edges.push({ from: from.id, to: to.id, distanceMeters, bearing });
+      edges.push({
+        from: to.id,
+        to: from.id,
+        distanceMeters,
+        bearing: normalizeHeading(bearing + 180),
+      });
+    }
+  }
+
+  return { edges, nodes: graphNodes };
+}
+
+function selectPreviewForwardIntersection(
+  segmentData: Json,
+  origin: { lat: number; lon: number },
+  heading: number | null,
+): Json | null {
+  const graph = segmentData._previewGraph as PreviewGraph | undefined;
+  const intersections = (segmentData.intersections || []) as IntersectionRow[];
+  if (!graph?.edges?.length || !intersections.length) return null;
+
+  const intersectionById = new Map(intersections.map((row) => [row.id, row]));
+  const outgoing = new Map<number, PreviewGraphEdge[]>();
+  for (const edge of graph.edges) {
+    const rows = outgoing.get(edge.from) || [];
+    rows.push(edge);
+    outgoing.set(edge.from, rows);
+  }
+
+  let nearest: { edge: PreviewGraphEdge; distanceToEdge: number; remainingMeters: number } | null = null;
+  for (const edge of graph.edges) {
+    const from = graph.nodes[String(edge.from)];
+    const to = graph.nodes[String(edge.to)];
+    if (!from || !to) continue;
+    const projection = projectPointToSegment(origin, from, to);
+    const headingPenalty = heading === null ? 0 : Math.abs(signedBearingDelta(heading, edge.bearing)) * 1.5;
+    const score = projection.distanceMeters + headingPenalty;
+    if (!nearest || score < nearest.distanceToEdge) {
+      nearest = {
+        edge,
+        distanceToEdge: score,
+        remainingMeters: edge.distanceMeters * (1 - projection.fraction),
+      };
+    }
+  }
+  if (!nearest) return null;
+
+  let previous = nearest.edge.from;
+  let current = nearest.edge.to;
+  let approachBearing = nearest.edge.bearing;
+  let distanceMeters = nearest.remainingMeters;
+  const visited = new Set<string>();
+
+  for (let step = 0; step < 10000; step += 1) {
+    const visitKey = `${previous}:${current}`;
+    if (visited.has(visitKey)) return null;
+    visited.add(visitKey);
+
+    const intersection = intersectionById.get(current);
+    if (intersection && distanceMeters > 3) {
+      const turns = resolveTurnCandidates(
+        ((intersection as unknown as Json).crossBearingOptions || []) as Array<{ roadName: string; bearing: number }>,
+        approachBearing,
+      );
+      return {
+        ...intersection,
+        distanceMetersFromCurrent: Math.round(distanceMeters),
+        bearingFromCurrent: Math.round(nearest.edge.bearing),
+        directionFromCurrent: headingLabel(nearest.edge.bearing),
+        approachBearing: Math.round(approachBearing),
+        leftTurn: turns.left,
+        rightTurn: turns.right,
+      };
+    }
+
+    const candidates = (outgoing.get(current) || []).filter((edge) => edge.to !== previous);
+    if (!candidates.length) return null;
+    candidates.sort((a, b) =>
+      Math.abs(signedBearingDelta(approachBearing, a.bearing)) -
+      Math.abs(signedBearingDelta(approachBearing, b.bearing)));
+    const next = candidates[0];
+    previous = current;
+    current = next.to;
+    approachBearing = next.bearing;
+    distanceMeters += next.distanceMeters;
+  }
+  return null;
+}
+
+function projectPointToSegment(
+  point: { lat: number; lon: number },
+  from: { lat: number; lon: number },
+  to: { lat: number; lon: number },
+): { fraction: number; distanceMeters: number } {
+  const latScale = 111320;
+  const lonScale = Math.max(1, Math.cos((point.lat * Math.PI) / 180) * latScale);
+  const ax = (from.lon - point.lon) * lonScale;
+  const ay = (from.lat - point.lat) * latScale;
+  const bx = (to.lon - point.lon) * lonScale;
+  const by = (to.lat - point.lat) * latScale;
+  const dx = bx - ax;
+  const dy = by - ay;
+  const denominator = dx * dx + dy * dy;
+  const fraction = denominator > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / denominator)) : 0;
+  return {
+    fraction,
+    distanceMeters: Math.hypot(ax + fraction * dx, ay + fraction * dy),
+  };
 }
 
 function dedupeIntersections<T extends { id: number }>(

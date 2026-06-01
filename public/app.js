@@ -37,6 +37,11 @@ const state = {
   },
 };
 
+const liveAnnouncementState = {
+  text: "",
+  at: 0,
+};
+
 const I18N = {
   "zh-Hant": {
     title: "AlaVia 文字地圖導覽",
@@ -139,11 +144,15 @@ const I18N = {
     indoorMoveBy: "往{direction}移動 {meters}m",
     indoorMoveDone: "已往{direction}移動約 {meters}m",
     indoorMoveUnavailable: "此方向沒有可靠的室內全景連結",
+    indoorEntryLowConfidenceManual: "室內入口判斷信心較低，請改以街景圖片與方向按鈕人工判讀。",
+    indoorMoveLowConfidenceManual: "室內移動判斷信心較低，請改以街景圖片與方向按鈕人工判讀。",
     indoorMoveResult: "移動結果：{status}。目前 {provider}，候選入口：{candidates}",
     indoorMoveChanged: "已切換至新的 Street View 點",
     indoorMoveSame: "仍在同一 Street View 點",
     indoorProvider: "影像來源：{provider}",
     indoorCandidateMeta: "{label} - {provider}，{distance}m [{direction}]，{links} 個可行方向",
+    indoorCandidateCompact: "{label} · {location}",
+    indoorCandidateTooltip: "來源：{provider}，{links} 個可行方向",
     indoorCandidateCurrent: "目前點",
     indoorFollowupPlaceholder: "對此圖像追問，例如：哪個方向有出口？",
     indoorFollowupAsk: "追問",
@@ -252,11 +261,15 @@ const I18N = {
     indoorMoveBy: "Move {meters}m to {direction}",
     indoorMoveDone: "Moved about {meters}m to {direction}",
     indoorMoveUnavailable: "No reliable indoor panorama link is available in this direction",
+    indoorEntryLowConfidenceManual: "Indoor entry confidence is low. Please decide manually using Street View images and direction buttons.",
+    indoorMoveLowConfidenceManual: "Indoor move confidence is low. Please decide manually using Street View images and direction buttons.",
     indoorMoveResult: "Move result: {status}. Current provider: {provider}. Candidates: {candidates}",
     indoorMoveChanged: "switched to a new Street View point",
     indoorMoveSame: "still on the same Street View point",
     indoorProvider: "Image provider: {provider}",
     indoorCandidateMeta: "{label} - {provider}, {distance}m [{direction}], {links} walkable directions",
+    indoorCandidateCompact: "{label} · {location}",
+    indoorCandidateTooltip: "Source: {provider}, {links} walkable directions",
     indoorCandidateCurrent: "current spot",
     indoorFollowupPlaceholder: "Ask about this image, e.g. which direction has an exit?",
     indoorFollowupAsk: "Ask",
@@ -365,11 +378,15 @@ const I18N = {
     indoorMoveBy: "{direction}へ {meters}m 移動",
     indoorMoveDone: "{direction}へ約 {meters}m 移動しました",
     indoorMoveUnavailable: "この方向には信頼できる屋内パノラマリンクがありません",
+    indoorEntryLowConfidenceManual: "屋内入口の判定信頼度が低いため、Street View画像と方向ボタンで手動判断してください。",
+    indoorMoveLowConfidenceManual: "屋内移動の判定信頼度が低いため、Street View画像と方向ボタンで手動判断してください。",
     indoorMoveResult: "移動結果: {status}。現在の提供元: {provider}。候補入口: {candidates}",
     indoorMoveChanged: "新しい Street View ポイントへ切替",
     indoorMoveSame: "同じ Street View ポイントのまま",
     indoorProvider: "画像提供元: {provider}",
     indoorCandidateMeta: "{label} - {provider}、{distance}m [{direction}]、移動可能方向 {links} 件",
+    indoorCandidateCompact: "{label} · {location}",
+    indoorCandidateTooltip: "提供元: {provider}、移動可能方向 {links} 件",
     indoorCandidateCurrent: "現在地",
     indoorFollowupPlaceholder: "この画像について質問（例: 出口はどの方向ですか？）",
     indoorFollowupAsk: "質問",
@@ -478,11 +495,15 @@ const I18N = {
     indoorMoveBy: "{direction} 방향으로 {meters}m 이동",
     indoorMoveDone: "{direction} 방향으로 약 {meters}m 이동했습니다",
     indoorMoveUnavailable: "이 방향에는 신뢰할 수 있는 실내 파노라마 링크가 없습니다",
+    indoorEntryLowConfidenceManual: "실내 진입 판단 신뢰도가 낮습니다. Street View 이미지와 방향 버튼으로 수동 판단해 주세요.",
+    indoorMoveLowConfidenceManual: "실내 이동 판단 신뢰도가 낮습니다. Street View 이미지와 방향 버튼으로 수동 판단해 주세요.",
     indoorMoveResult: "이동 결과: {status}. 현재 제공자: {provider}. 후보 입구: {candidates}",
     indoorMoveChanged: "새 Street View 지점으로 전환됨",
     indoorMoveSame: "같은 Street View 지점에 머무름",
     indoorProvider: "이미지 제공자: {provider}",
     indoorCandidateMeta: "{label} - {provider}, {distance}m [{direction}], 이동 가능 방향 {links}개",
+    indoorCandidateCompact: "{label} · {location}",
+    indoorCandidateTooltip: "제공자: {provider}, 이동 가능 방향 {links}개",
     indoorCandidateCurrent: "현재 지점",
     indoorFollowupPlaceholder: "이 이미지에 대해 질문하세요. 예: 출구는 어느 방향인가요?",
     indoorFollowupAsk: "질문",
@@ -545,9 +566,17 @@ function tf(key, vars = {}) {
 function announceLive(text) {
   const region = $("srAnnouncements");
   if (!region) return;
+  const message = String(text || "").trim();
+  if (!message) return;
+  const now = Date.now();
+  if (message === liveAnnouncementState.text && now - liveAnnouncementState.at < 1500) {
+    return;
+  }
+  liveAnnouncementState.text = message;
+  liveAnnouncementState.at = now;
   region.textContent = "";
   setTimeout(() => {
-    region.textContent = String(text || "");
+    region.textContent = message;
   }, 20);
 }
 
@@ -858,20 +887,36 @@ function getBestIndoorMoveLink(links, bearing) {
   return bestDelta <= 55 ? { link: best, delta: Math.round(bestDelta) } : null;
 }
 
+function getIndoorLowConfidenceMessage(stage) {
+  return stage === "entry" ? t("indoorEntryLowConfidenceManual") : t("indoorMoveLowConfidenceManual");
+}
+
 function formatIndoorCandidateButton(candidate, index, currentNode, active) {
   const metrics = getIndoorCandidateMetrics(candidate, currentNode);
   const label = `入口 ${String.fromCharCode(65 + index)}`;
+  const location = metrics.isCurrent ? t("indoorCandidateCurrent") : `${metrics.distanceMeters}m [${metrics.direction}]`;
+  const prefix = active ? "*" : "";
+  return `${prefix}${tf("indoorCandidateCompact", {
+    label,
+    location,
+  })}`;
+}
+
+function formatIndoorCandidateTooltip(candidate, index, currentNode) {
+  const metrics = getIndoorCandidateMetrics(candidate, currentNode);
   const provider = providerLabel(candidate?.node);
   const linkCount = Array.isArray(candidate?.node?.links) ? candidate.node.links.length : 0;
-  const place = metrics.isCurrent ? t("indoorCandidateCurrent") : `${metrics.distanceMeters}m [${metrics.direction}]`;
-  const prefix = active ? "*" : "";
-  return `${prefix}${tf("indoorCandidateMeta", {
+  const label = `入口 ${String.fromCharCode(65 + index)}`;
+  return `${tf("indoorCandidateMeta", {
     label,
     provider,
     distance: metrics.distanceMeters,
     direction: metrics.isCurrent ? t("indoorCandidateCurrent") : metrics.direction,
     links: linkCount,
-  })}${metrics.isCurrent ? ` (${place})` : ""}`;
+  })}\n${tf("indoorCandidateTooltip", {
+    provider,
+    links: linkCount,
+  })}`;
 }
 
 function summarizeIndoorCandidates(candidates, currentNode) {
@@ -1352,6 +1397,7 @@ function renderIndoorCandidateButtons(parentPanel) {
     btn.type = "button";
     btn.className = "link-button";
     btn.textContent = formatIndoorCandidateButton(c, i, state.quickStreet.currentNode, i === state.quickStreet.selectedCandidateIndex);
+    btn.title = formatIndoorCandidateTooltip(c, i, state.quickStreet.currentNode);
     btn.addEventListener("click", async () => {
       await switchIndoorCandidate(i, parentPanel);
     });
@@ -1446,7 +1492,7 @@ async function moveQuickIndoorByBearing(bearing, parentPanel) {
   const decision = decisionResp?.decision || {};
 
   if (decision?.fallbackToManual) {
-    const fallbackMessage = t("indoorLowConfidenceManual");
+    const fallbackMessage = getIndoorLowConfidenceMessage("move");
     announceLive(fallbackMessage);
     updateQuickNavStatus(fallbackMessage);
     return;
@@ -1671,7 +1717,7 @@ async function tryFindIndoorEntry(row, heading, panel) {
   updateQuickNavStatus(switchedMessage);
 
   if (entry?.fallbackToManual) {
-    const fallbackMessage = t("indoorLowConfidenceManual");
+    const fallbackMessage = getIndoorLowConfidenceMessage("entry");
     const fallbackHint = document.createElement("div");
     fallbackHint.className = "minor";
     fallbackHint.textContent = fallbackMessage;
@@ -2637,6 +2683,7 @@ function createCard(row, index, total) {
         btn.type = "button";
         btn.className = "link-button";
         btn.textContent = formatIndoorCandidateButton(c, i, indoorNode, i === selectedIndoorCandidate);
+        btn.title = formatIndoorCandidateTooltip(c, i, indoorNode);
         btn.addEventListener("click", async () => {
           if (!c?.node?.panoId) return;
           await hydrateIndoorNodeLinks(c.node);
@@ -2709,7 +2756,7 @@ function createCard(row, index, total) {
         });
         const decision = decisionResp?.decision || {};
         if (decision?.fallbackToManual) {
-          const fallbackMessage = t("indoorLowConfidenceManual");
+          const fallbackMessage = getIndoorLowConfidenceMessage("move");
           announceLive(fallbackMessage);
           updateQuickNavStatus(fallbackMessage);
           return;
@@ -2840,10 +2887,10 @@ function createCard(row, index, total) {
       if (entry?.fallbackToManual) {
         const fallbackHint = document.createElement("div");
         fallbackHint.className = "minor";
-        fallbackHint.textContent = t("indoorLowConfidenceManual");
+        fallbackHint.textContent = getIndoorLowConfidenceMessage("entry");
         indoorResult.appendChild(fallbackHint);
-        announceLive(t("indoorLowConfidenceManual"));
-        updateQuickNavStatus(t("indoorLowConfidenceManual"));
+        announceLive(getIndoorLowConfidenceMessage("entry"));
+        updateQuickNavStatus(getIndoorLowConfidenceMessage("entry"));
       }
       indoorResult.appendChild(renderCardIndoorControls());
     } catch (err) {
