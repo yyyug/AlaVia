@@ -154,11 +154,23 @@ See [API.md](API.md) for complete endpoint documentation.
 - `POST /api/paid/places` - Get nearby landmarks from Google Places
 - `POST /api/osm/route-places` - Get OSM landmarks between two points
 - `POST /api/osm/indoor-graph` - Get a normalized OSM indoor navigation graph
-- `POST /api/indoor/graph` - Combine OSM indoor topology with Street View panorama links
+- `POST /api/dp/availability` - Check whether a Hokonavi DP exploration entry is available within 300 meters
+- `POST /api/dp/indoor-graph` - Get free Hokonavi DP walking-space data from all 28 published `nwd_*` datasets
+- `POST /api/indoor/graph` - Combine Hokonavi DP, OSM indoor topology, and Street View panorama links
 - `POST /api/streetview/metadata` - Check Street View coverage (free)
 - `POST /api/streetview/resolve-pano` - Resolve Street View Tiles metadata, real link distances, and indoor/outdoor transitions
 - `POST /api/admin/cleanup-noimage` - Remove no-coverage cache entries
 - `POST /api/admin/streetview-storage` - Query cache statistics
+
+**Hokonavi DP preload:**
+
+```bash
+npm run sync:dp -- --dry-run
+npm run sync:dp -- --env production
+```
+
+The sync command validates all 28 published `nwd_*` walking-network datasets and uploads raw GeoJSON, normalized graphs, and `hokonavi-dp/manifest.json` to R2. The three `facility_*` datasets are intentionally excluded because they are not walking networks.
+For non-interactive production uploads, set `CLOUDFLARE_API_TOKEN` with R2 write access before running the second command.
 
 ## 💾 Database Schema
 

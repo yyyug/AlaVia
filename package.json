@@ -7,6 +7,7 @@
     "build": "tsc --outDir dist --rootDir src",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "sync:dp": "node scripts/sync-hokonavi-dp.mjs",
     "prefetch:hk": "node scripts/prefetch-hk-streets.mjs",
     "tiles:clear": "powershell -ExecutionPolicy Bypass -File scripts/clear-soundscape-tiles.ps1",
     "neon:apply:soundscape-tile": "node scripts/apply-neon-soundscape-tile.mjs"

@@ -43,6 +43,7 @@ import {
 import { dispatchRoute } from "./services/http-router";
 import { ensureD1Schema } from "./services/schema";
 import { handleTilesRequest as handleTilesRequestFromService } from "./services/tiles";
+import { HOKONAVI_DP_MANIFEST } from "./data/hokonavi-dp-manifest";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -183,7 +184,7 @@ type IndoorGraphNode = {
   kind: string;
   label: string | null;
   level: string | null;
-  source: "osm" | "streetview";
+  source: "osm" | "streetview" | "hokonavi-dp";
   properties: Json;
 };
 
@@ -198,13 +199,27 @@ type IndoorGraphEdge = {
   targetImageryType?: IndoorImageryType;
   exitsIndoor?: boolean;
   requiresConfirmation?: boolean;
-  source: "osm" | "streetview";
+  source: "osm" | "streetview" | "hokonavi-dp";
   properties: Json;
 };
 
 type IndoorGraph = {
   nodes: IndoorGraphNode[];
   edges: IndoorGraphEdge[];
+};
+
+type GeoJsonFeature = {
+  type?: string;
+  geometry?: {
+    type?: string;
+    coordinates?: unknown;
+  };
+  properties?: Json;
+};
+
+type GeoJsonFeatureCollection = {
+  type?: string;
+  features?: GeoJsonFeature[];
 };
 
 type LinkAnalysisResult = {
@@ -260,6 +275,8 @@ export default {
       { pathname: "/api/intersections/near", method: "POST", handler: () => withErrorHandling(() => handleIntersectionsNear(request, env, ctx)) },
       { pathname: "/api/osm/tile", method: "POST", handler: () => withErrorHandling(() => handleOsmTile(request, env, ctx)) },
       { pathname: "/api/osm/indoor-graph", method: "POST", handler: () => withErrorHandling(() => handleOsmIndoorGraph(request, env, ctx)) },
+      { pathname: "/api/dp/availability", method: "POST", handler: () => withErrorHandling(() => handleHokonaviDpAvailability(request, env)) },
+      { pathname: "/api/dp/indoor-graph", method: "POST", handler: () => withErrorHandling(() => handleHokonaviDpIndoorGraph(request, env, ctx)) },
       { pathname: "/api/indoor/graph", method: "POST", handler: () => withErrorHandling(() => handleUnifiedIndoorGraph(request, env, ctx)) },
       { pathname: "/api/osm/scan-nearby", method: "POST", handler: () => withErrorHandling(() => handleOsmScanNearby(request, env, ctx)) },
       { pathname: "/api/osm/places-around", method: "POST", handler: () => withErrorHandling(() => handleOsmPlacesAround(request, env, ctx)) },
@@ -952,6 +969,291 @@ async function handleOsmIndoorGraph(request: Request, env: Env, ctx: ExecutionCo
   return json(cached.data);
 }
 
+type HokonaviDpDataset = {
+  id: string;
+  title: string;
+  sourceLabel: string;
+  updatedAt: string;
+  catalogUrl: string;
+  nodeUrl: string;
+  linkUrl: string;
+  bounds: { minLat: number; maxLat: number; minLon: number; maxLon: number };
+  nodeCount: number;
+  edgeCount: number;
+};
+
+const HOKONAVI_DP_FALLBACK_DATASETS = HOKONAVI_DP_MANIFEST.datasets as readonly HokonaviDpDataset[];
+const HOKONAVI_DP_WARNING = "DP 資料不是即時資訊；實際環境、施工及設備狀態仍需現場確認。";
+let hokonaviDpDatasetsPromise: Promise<readonly HokonaviDpDataset[]> | null = null;
+
+async function handleHokonaviDpAvailability(request: Request, env: Env): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(40, Math.min(300, Number(body.radiusMeters ?? 300)));
+  validateCoordinates(lat, lon);
+  const datasets = await findNearbyHokonaviDpDatasets(env, lat, lon, radiusMeters);
+  if (!datasets.length) return json({ ok: true, found: false, source: "hokonavi-dp" });
+
+  const graphs = await Promise.all(datasets.map((dataset) => getHokonaviDpGraph(env, dataset)));
+  const nearestNode = findNearestIndoorGraphNode(graphs.flatMap((graph) => graph.nodes), lat, lon);
+  const distanceMeters = Number(nearestNode?.distanceMeters);
+  if (!nearestNode || !Number.isFinite(distanceMeters) || distanceMeters >= 300) {
+    return json({ ok: true, found: false, source: "hokonavi-dp" });
+  }
+  return json({
+    ok: true,
+    found: true,
+    source: "hokonavi-dp",
+    sourceLabel: "ほこナビ DP",
+    datasets: datasets.map(getHokonaviDpDatasetMetadata),
+    nearestNode,
+    bearing: Math.round(bearingDegrees({ lat, lon }, nearestNode)),
+  });
+}
+
+async function handleHokonaviDpIndoorGraph(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = await requireJson(request);
+  const lat = Number(body.lat);
+  const lon = Number(body.lon);
+  const radiusMeters = Math.max(40, Math.min(1200, Number(body.radiusMeters ?? 350)));
+  validateCoordinates(lat, lon);
+
+  const datasets = await findNearbyHokonaviDpDatasets(env, lat, lon, radiusMeters);
+  if (!datasets.length) {
+    return json({
+      ok: true,
+      found: false,
+      source: "hokonavi-dp",
+      datasets: [],
+      graph: { nodes: [], edges: [] },
+      error: "目前位置附近沒有ほこナビ DP 步行空間網絡資料",
+    });
+  }
+
+  const graph = mergeIndoorGraphs(...await Promise.all(datasets.map((dataset) => getHokonaviDpGraph(env, dataset))));
+  const nearbyGraph = sliceIndoorGraphByRadius(graph, lat, lon, radiusMeters);
+  const nearestNode = findNearestIndoorGraphNode(nearbyGraph.nodes, lat, lon);
+  return json({
+    ok: true,
+    found: Boolean(nearestNode),
+    source: "hokonavi-dp",
+    sourceLabel: "ほこナビ DP",
+    datasets: datasets.map(getHokonaviDpDatasetMetadata),
+    radiusMeters,
+    nearestNode,
+    graph: nearbyGraph,
+  });
+}
+
+async function getHokonaviDpGraph(env: Env, dataset: HokonaviDpDataset): Promise<IndoorGraph> {
+  const normalizedKey = `hokonavi-dp/normalized/${dataset.id}/graph.json`;
+  const cached = await env.CACHE_BUCKET.get(normalizedKey);
+  if (cached) return (await cached.json()) as IndoorGraph;
+
+  const [nodeResponse, linkResponse] = await Promise.all([
+    fetchWithTimeout(dataset.nodeUrl, {}, 30_000),
+    fetchWithTimeout(dataset.linkUrl, {}, 30_000),
+  ]);
+  if (!nodeResponse.ok || !linkResponse.ok) {
+    throw new Error(`ほこナビ DP download failed for ${dataset.id} (${nodeResponse.status}/${linkResponse.status})`);
+  }
+  const [nodeText, linkText] = await Promise.all([nodeResponse.text(), linkResponse.text()]);
+  const graph = buildHokonaviDpIndoorGraph(
+    dataset.id,
+    JSON.parse(nodeText) as GeoJsonFeatureCollection,
+    JSON.parse(linkText) as GeoJsonFeatureCollection,
+  );
+  await Promise.all([
+    env.CACHE_BUCKET.put(`hokonavi-dp/raw/${dataset.id}/node.geojson`, nodeText, { httpMetadata: { contentType: "application/geo+json" } }),
+    env.CACHE_BUCKET.put(`hokonavi-dp/raw/${dataset.id}/link.geojson`, linkText, { httpMetadata: { contentType: "application/geo+json" } }),
+    env.CACHE_BUCKET.put(normalizedKey, JSON.stringify(graph), { httpMetadata: { contentType: "application/json" } }),
+  ]);
+  return graph;
+}
+
+function getHokonaviDpDatasetMetadata(dataset: HokonaviDpDataset): Json {
+  return {
+    id: dataset.id,
+    title: dataset.title,
+    sourceLabel: "ほこナビ DP",
+    updatedAt: dataset.updatedAt,
+    catalogUrl: dataset.catalogUrl,
+    warning: HOKONAVI_DP_WARNING,
+  };
+}
+
+async function getHokonaviDpDatasets(env: Env): Promise<readonly HokonaviDpDataset[]> {
+  if (!hokonaviDpDatasetsPromise) {
+    hokonaviDpDatasetsPromise = (async () => {
+      const object = await env.CACHE_BUCKET.get("hokonavi-dp/manifest.json");
+      if (!object) return HOKONAVI_DP_FALLBACK_DATASETS;
+      const manifest = (await object.json()) as Json;
+      return Array.isArray(manifest.datasets)
+        ? manifest.datasets as HokonaviDpDataset[]
+        : HOKONAVI_DP_FALLBACK_DATASETS;
+    })();
+  }
+  return hokonaviDpDatasetsPromise;
+}
+
+async function findNearbyHokonaviDpDatasets(
+  env: Env,
+  lat: number,
+  lon: number,
+  radiusMeters: number,
+): Promise<HokonaviDpDataset[]> {
+  const margin = radiusMeters / 100_000;
+  const datasets = await getHokonaviDpDatasets(env);
+  return datasets.filter((dataset) => {
+    const bounds = dataset.bounds;
+    return lat >= bounds.minLat - margin
+      && lat <= bounds.maxLat + margin
+      && lon >= bounds.minLon - margin
+      && lon <= bounds.maxLon + margin;
+  });
+}
+
+function buildHokonaviDpIndoorGraph(
+  datasetId: string,
+  nodeCollection: GeoJsonFeatureCollection,
+  linkCollection: GeoJsonFeatureCollection,
+): IndoorGraph {
+  const nodes = new Map<string, IndoorGraphNode>();
+  for (const feature of nodeCollection.features || []) {
+    const properties = feature.properties || {};
+    const nodeId = String(properties.node_id || "").trim();
+    const coordinates = feature.geometry?.coordinates;
+    const lon = Number(Array.isArray(coordinates) ? coordinates[0] : properties.lon);
+    const lat = Number(Array.isArray(coordinates) ? coordinates[1] : properties.lat);
+    if (!nodeId || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    nodes.set(nodeId, {
+      id: `hokonavi-dp-node:${datasetId}:${nodeId}`,
+      lat: round6(lat),
+      lon: round6(lon),
+      kind: classifyHokonaviDpNode(properties),
+      label: null,
+      level: formatHokonaviDpFloor(properties.floor),
+      source: "hokonavi-dp",
+      properties: { ...properties, datasetId, sourceLabel: "ほこナビ DP" },
+    });
+  }
+
+  const edges: IndoorGraphEdge[] = [];
+  for (const feature of linkCollection.features || []) {
+    const properties = feature.properties || {};
+    const linkId = String(properties.link_id || "").trim();
+    const startId = String(properties.start_id || "").trim();
+    const endId = String(properties.end_id || "").trim();
+    const from = nodes.get(startId);
+    const to = nodes.get(endId);
+    if (!linkId || !from || !to) continue;
+    const distanceMeters = toNullableNumber(properties.distance);
+    const kind = classifyHokonaviDpEdge(properties);
+    const direction = Number(properties.direction);
+    const shared = {
+      distanceMeters,
+      kind,
+      requiresConfirmation: requiresHokonaviDpConfirmation(properties, from, to),
+      source: "hokonavi-dp" as const,
+      properties: { ...properties, datasetId, sourceLabel: "ほこナビ DP" },
+    };
+    if (direction !== 3) {
+      edges.push({
+        id: `hokonavi-dp-link:${datasetId}:${linkId}:forward`,
+        from: from.id,
+        to: to.id,
+        bearing: Math.round(bearingDegrees(from, to)),
+        level: formatIndoorGraphLevelTransition(from, to),
+        ...shared,
+      });
+    }
+    if (direction !== 2) {
+      edges.push({
+        id: `hokonavi-dp-link:${datasetId}:${linkId}:reverse`,
+        from: to.id,
+        to: from.id,
+        bearing: Math.round(bearingDegrees(to, from)),
+        level: formatIndoorGraphLevelTransition(to, from),
+        ...shared,
+      });
+    }
+  }
+  return { nodes: [...nodes.values()], edges };
+}
+
+function formatIndoorGraphLevelTransition(from: IndoorGraphNode, to: IndoorGraphNode): string | null {
+  return from.level === to.level ? from.level : `${from.level || "?"}->${to.level || "?"}`;
+}
+
+function sliceIndoorGraphByRadius(graph: IndoorGraph, lat: number, lon: number, radiusMeters: number): IndoorGraph {
+  const included = new Set(
+    graph.nodes
+      .filter((node) => haversineMeters({ lat, lon }, node) <= radiusMeters)
+      .map((node) => node.id),
+  );
+  const edges = graph.edges.filter((edge) => included.has(edge.from) && included.has(edge.to));
+  const connected = new Set(edges.flatMap((edge) => [edge.from, edge.to]));
+  const nodes = graph.nodes.filter((node) => connected.has(node.id));
+  return { nodes, edges };
+}
+
+function findNearestIndoorGraphNode(
+  nodes: IndoorGraphNode[],
+  lat: number,
+  lon: number,
+): (IndoorGraphNode & { distanceMeters: number }) | null {
+  let nearest: IndoorGraphNode | null = null;
+  let distanceMeters = Number.POSITIVE_INFINITY;
+  for (const node of nodes) {
+    const distance = haversineMeters({ lat, lon }, node);
+    if (distance < distanceMeters) {
+      nearest = node;
+      distanceMeters = distance;
+    }
+  }
+  return nearest ? { ...nearest, distanceMeters: Math.round(distanceMeters * 10) / 10 } : null;
+}
+
+function classifyHokonaviDpNode(properties: Json): string {
+  const inOut = Number(properties.in_out);
+  if (inOut === 2) return "facility_boundary";
+  if (inOut === 3) return "facility_interior";
+  return "pedestrian_node";
+}
+
+function classifyHokonaviDpEdge(properties: Json): string {
+  const routeType = Number(properties.route_type);
+  const structure = Number(properties.rt_struct);
+  if (routeType === 2) return "moving_walkway";
+  if (routeType === 4) return "elevator";
+  if (routeType === 5) return "escalator";
+  if (routeType === 6) return "stairs";
+  if (routeType === 7) return "ramp";
+  if (structure === 5) return "underground_passage";
+  if (structure === 6) return "footbridge";
+  if (structure === 7) return "facility_corridor";
+  return "pedestrian_path";
+}
+
+function formatHokonaviDpFloor(value: unknown): string | null {
+  const floor = Number(value);
+  if (!Number.isFinite(floor)) return null;
+  return String(floor);
+}
+
+function toNullableNumber(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function requiresHokonaviDpConfirmation(properties: Json, from: IndoorGraphNode, to: IndoorGraphNode): boolean {
+  const routeType = Number(properties.route_type);
+  const unknown = Number(properties.rt_struct) === 99 || routeType === 99;
+  const boundary = Number(from.properties.in_out) !== Number(to.properties.in_out);
+  return unknown || boundary || from.level !== to.level || [4, 5, 6].includes(routeType);
+}
+
 async function handleUnifiedIndoorGraph(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await requireJson(request);
   const lat = Number(body.lat);
@@ -963,19 +1265,24 @@ async function handleUnifiedIndoorGraph(request: Request, env: Env, ctx: Executi
   const mapsKey = requireGoogleMapsKey(env);
   const cached = await getOrCreateCached(
     env,
-    "unified-indoor-graph-v1",
+    "unified-indoor-graph-v2",
     { lat: round5(lat), lon: round5(lon), radiusMeters, panoId },
     async () => {
       const osmResult = await fetchOverpassPlaceJson(buildOsmIndoorGraphQuery(lat, lon, radiusMeters));
       const osmGraph = buildOsmIndoorGraph(osmResult.data);
       const streetViewNode = await resolveStreetViewPanoNode(mapsKey, { panoId, lat, lon, radiusMeters: 50 });
       const streetViewGraph = streetViewNode ? buildStreetViewIndoorGraph(streetViewNode) : { nodes: [], edges: [] };
+      const dpDatasets = await findNearbyHokonaviDpDatasets(env, lat, lon, radiusMeters);
+      const dpGraph = dpDatasets.length
+        ? sliceIndoorGraphByRadius(mergeIndoorGraphs(...await Promise.all(dpDatasets.map((dataset) => getHokonaviDpGraph(env, dataset)))), lat, lon, radiusMeters)
+        : { nodes: [], edges: [] };
       return {
         ok: true,
         lat: round6(lat),
         lon: round6(lon),
         radiusMeters,
-        graph: mergeIndoorGraphs(osmGraph, streetViewGraph),
+        graph: mergeIndoorGraphs(dpGraph, osmGraph, streetViewGraph),
+        sources: dpGraph.nodes.length ? dpDatasets.map((dataset) => ({ source: "hokonavi-dp", dataset: getHokonaviDpDatasetMetadata(dataset) })) : [],
         currentStreetViewNode: streetViewNode,
       } as Json;
     },

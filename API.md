@@ -99,8 +99,16 @@ All endpoints use JSON request/response unless noted.
 - POST /api/osm/indoor-graph
   - Purpose: normalized OSM indoor `nodes` / `edges` graph
   - Includes corridors, entrances, elevators, stairs, platforms, levels, and preserved OSM properties
+- POST /api/dp/indoor-graph
+  - Purpose: free Hokonavi DP walking-space graph from all 28 published `nwd_*` datasets
+  - Body: `{ "lat": 35.6909, "lon": 139.7003, "radiusMeters": 500 }`
+  - Source is explicitly labeled `hokonavi-dp`; includes DP distance, floors, indoor/facility boundaries, stairs, elevators, escalators, tactile paving, and audible traffic signals
+  - Dataset is not live data. The response includes the DP dataset date and safety warning.
+- POST /api/dp/availability
+  - Purpose: lightweight check for a nearby Hokonavi DP node before displaying the exploration button
+  - Returns a candidate only when the nearest DP node is less than 300 meters away
 - POST /api/indoor/graph
-  - Purpose: unified indoor graph combining nearby OSM topology and the current Street View panorama links
+  - Purpose: unified indoor graph combining Hokonavi DP, nearby OSM topology, and the current Street View panorama links
 - POST /api/osm/scan-nearby
 - POST /api/osm/places-around
 - POST /api/osm/route-places

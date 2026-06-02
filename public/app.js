@@ -35,6 +35,14 @@ const state = {
     selectedCandidateIndex: -1,
     graphCache: new Map(),
   },
+  dpExplore: {
+    graph: null,
+    datasets: [],
+    availability: null,
+    currentNodeId: null,
+    heading: 0,
+    history: [],
+  },
 };
 
 const liveAnnouncementState = {
@@ -74,6 +82,16 @@ const I18N = {
     routeGoogle: "沿街地點 Google Places",
     streetDetail: "街景詳細描述",
     indoorNav: "室內導覽",
+    dpExplore: "DP 步行空間探索",
+    dpSource: "資料來源：ほこナビ DP。資料不是即時資訊，實際環境及設備狀態仍需現場確認。",
+    dpNoCoverage: "目前位置附近沒有ほこナビ DP 步行空間網絡資料。",
+    dpEntryConfirm: "最近的ほこナビ DP 節點在{direction}約 {meters} 公尺。尚未到達 DP 路網，是否仍要進入虛擬探索模式？",
+    dpDatasets: "DP 資料集：{datasets}",
+    dpNoLinks: "此 DP 節點沒有可繼續探索的連線。",
+    dpBack: "返回上一個 DP 節點",
+    dpMoveConfirm: "DP 提示此移動涉及風險或環境轉換：{summary}\n是否繼續？",
+    dpCurrent: "目前 DP 節點：樓層 {level}。可選方向如下：",
+    dpMoved: "已依 DP 路網移動：{summary}",
     noDataLoaded: "尚未載入路口資料。",
     costStreet: "展開街景詳細描述：{calls} 次，預估 {usd}",
     costRouteOsm: "沿街地點 OSM：{calls} 次，使用 OSM 免費資料",
@@ -191,6 +209,16 @@ const I18N = {
     routeGoogle: "Route Places Google Places",
     streetDetail: "Street Scene Details",
     indoorNav: "Indoor Navigation",
+    dpExplore: "DP Walking-Space Exploration",
+    dpSource: "Source: Hokonavi DP. This is not live data. Confirm actual conditions and facility status on site.",
+    dpNoCoverage: "No Hokonavi DP walking-space data is available near this location.",
+    dpEntryConfirm: "The nearest Hokonavi DP node is about {meters} meters {direction}. You have not reached the DP network yet. Enter virtual exploration mode anyway?",
+    dpDatasets: "DP datasets: {datasets}",
+    dpNoLinks: "This DP node has no available onward links.",
+    dpBack: "Return to previous DP node",
+    dpMoveConfirm: "DP indicates a risk or environment transition: {summary}\nContinue?",
+    dpCurrent: "Current DP node: level {level}. Available directions:",
+    dpMoved: "Moved using the DP network: {summary}",
     noDataLoaded: "No intersection data loaded.",
     costStreet: "Street scene details: {calls} calls, estimated {usd}",
     costRouteOsm: "Route Places OSM: {calls} calls, using free OSM data",
@@ -629,6 +657,9 @@ function setStaticTexts() {
   refreshQuickIndoorButtonState();
   if ($("quickIndoorBtn")) {
     $("quickIndoorBtn").textContent = t("indoorNav");
+  }
+  if ($("quickDpBtn")) {
+    $("quickDpBtn").textContent = t("dpExplore");
   }
   $("intersectionSectionTitle").textContent = t("intersections");
 }
@@ -1432,8 +1463,211 @@ function resetQuickStreetPanel() {
     indoorPanel.classList.remove("error");
     indoorPanel.textContent = "";
   }
+  const dpPanel = $("quickNavDp");
+  if (dpPanel) {
+    dpPanel.classList.remove("error");
+    dpPanel.textContent = "";
+  }
+  state.dpExplore.graph = null;
+  state.dpExplore.datasets = [];
+  state.dpExplore.availability = null;
+  state.dpExplore.currentNodeId = null;
+  state.dpExplore.heading = 0;
+  state.dpExplore.history = [];
   refreshQuickStreetAdvanceButton();
   refreshQuickIndoorButtonState();
+}
+
+function getDpNode(nodeId) {
+  return state.dpExplore.graph?.nodes?.find((node) => node.id === nodeId) || null;
+}
+
+function getDpOutgoingEdges(nodeId) {
+  return (state.dpExplore.graph?.edges || []).filter((edge) => edge.from === nodeId);
+}
+
+function dpKindLabel(kind) {
+  const labels = {
+    moving_walkway: "自動行人道",
+    elevator: "升降機",
+    escalator: "扶手電梯",
+    stairs: "樓梯",
+    ramp: "斜道",
+    underground_passage: "地下通道",
+    footbridge: "行人天橋",
+    facility_corridor: "設施內通道",
+    pedestrian_path: "步行通道",
+  };
+  return labels[kind] || String(kind || "步行通道");
+}
+
+function dpRelativeDirection(bearing) {
+  const heading = Number(state.dpExplore.heading) || 0;
+  const delta = (((Number(bearing) - heading) % 360) + 360) % 360;
+  return bearingToRelativeDir(delta);
+}
+
+function formatDpEdgeSummary(edge) {
+  const target = getDpNode(edge.to);
+  const parts = [
+    `${dpRelativeDirection(edge.bearing)} ${Math.round(Number(edge.distanceMeters) || 0)} 公尺`,
+    dpKindLabel(edge.kind),
+  ];
+  if (edge.level && String(edge.level).includes("->")) parts.push(`樓層 ${edge.level}`);
+  if (Number(edge.properties?.brail_tile) === 2) parts.push("設有視障引導磚");
+  if ([2, 3].includes(Number(edge.properties?.tfc_s_type))) parts.push("設有音響交通燈");
+  if (Number(edge.properties?.roof) === 2) parts.push("有上蓋");
+  const fromInOut = Number(getDpNode(edge.from)?.properties?.in_out);
+  const toInOut = Number(target?.properties?.in_out);
+  if (fromInOut !== toInOut) parts.push("設施邊界轉換");
+  if (edge.requiresConfirmation) parts.push("移動前需要確認");
+  return `${parts.join("，")}。來源：DP`;
+}
+
+function renderDpExploration(panel, movedMessage = "") {
+  panel.classList.remove("error");
+  panel.innerHTML = "";
+  const currentNode = getDpNode(state.dpExplore.currentNodeId);
+  if (!currentNode) {
+    panel.classList.add("error");
+    panel.textContent = t("dpNoCoverage");
+    return;
+  }
+
+  const title = document.createElement("h4");
+  title.textContent = t("dpExplore");
+  panel.appendChild(title);
+  const source = document.createElement("div");
+  source.className = "minor indoor-provider";
+  source.textContent = t("dpSource");
+  panel.appendChild(source);
+  if (state.dpExplore.datasets.length) {
+    const datasets = document.createElement("div");
+    datasets.className = "minor indoor-provider";
+    datasets.textContent = tf("dpDatasets", {
+      datasets: state.dpExplore.datasets.map((dataset) => `${dataset.title} (${dataset.updatedAt})`).join("；"),
+    });
+    panel.appendChild(datasets);
+  }
+  if (movedMessage) appendIndoorStatus(panel, movedMessage);
+
+  if (state.dpExplore.history.length) {
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "advance-btn";
+    back.textContent = t("dpBack");
+    back.addEventListener("click", () => {
+      state.dpExplore.currentNodeId = state.dpExplore.history.pop();
+      renderDpExploration(panel);
+    });
+    panel.appendChild(back);
+  }
+
+  const heading = document.createElement("div");
+  heading.className = "minor";
+  heading.textContent = tf("dpCurrent", { level: currentNode.level ?? "?" });
+  panel.appendChild(heading);
+
+  const outgoing = getDpOutgoingEdges(currentNode.id);
+  if (!outgoing.length) {
+    appendIndoorStatus(panel, t("dpNoLinks"));
+    return;
+  }
+  const links = document.createElement("div");
+  links.className = "pano-links";
+  for (const edge of outgoing) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "link-button";
+    const summary = formatDpEdgeSummary(edge);
+    button.textContent = summary;
+    button.addEventListener("click", () => {
+      if (edge.requiresConfirmation && !window.confirm(tf("dpMoveConfirm", { summary }))) return;
+      state.dpExplore.history.push(currentNode.id);
+      state.dpExplore.currentNodeId = edge.to;
+      state.dpExplore.heading = Number(edge.bearing) || state.dpExplore.heading;
+      const moved = tf("dpMoved", { summary });
+      announceLive(moved);
+      updateQuickNavStatus(moved);
+      renderDpExploration(panel, moved);
+    });
+    links.appendChild(button);
+  }
+  panel.appendChild(links);
+}
+
+async function runQuickDpExploration() {
+  const row = state.intersections[state.focusedIndex];
+  const panel = $("quickNavDp");
+  if (!row || !panel) return;
+  panel.classList.remove("error");
+  panel.textContent = t("queryLoading");
+  try {
+    const availability = state.dpExplore.availability || await fetchDpAvailability(row);
+    if (!availability?.found) {
+      panel.textContent = "";
+      refreshQuickDpButtonState();
+      return;
+    }
+    const entryMeters = Number(availability.nearestNode?.distanceMeters);
+    if (entryMeters > 30 && !window.confirm(tf("dpEntryConfirm", {
+      direction: bearingToRelativeDir(Number(availability.bearing) - (Number(row.bearingToNext) || 0)),
+      meters: Math.round(entryMeters),
+    }))) {
+      panel.textContent = "";
+      return;
+    }
+    const data = await postJson("/api/dp/indoor-graph", {
+      lat: row.lat,
+      lon: row.lon,
+      radiusMeters: 500,
+    });
+    if (!data?.found || !data?.nearestNode?.id) {
+      panel.classList.add("error");
+      panel.textContent = data?.error || t("dpNoCoverage");
+      announceLive(panel.textContent);
+      return;
+    }
+    state.dpExplore.graph = data.graph;
+    state.dpExplore.datasets = Array.isArray(data.datasets) ? data.datasets : [];
+    state.dpExplore.currentNodeId = data.nearestNode.id;
+    state.dpExplore.heading = Number(row.bearingToNext) || 0;
+    state.dpExplore.history = [];
+    renderDpExploration(panel);
+    announceLive(`${t("dpExplore")}。${t("dpSource")}`);
+  } catch (err) {
+    panel.classList.add("error");
+    panel.textContent = `${t("errorPrefix")}${err.message}`;
+  }
+}
+
+async function fetchDpAvailability(row) {
+  return postJson("/api/dp/availability", {
+    lat: row.lat,
+    lon: row.lon,
+    radiusMeters: 300,
+  });
+}
+
+async function refreshQuickDpButtonState() {
+  const btn = $("quickDpBtn");
+  const row = state.intersections[state.focusedIndex];
+  if (!btn) return;
+  btn.hidden = true;
+  state.dpExplore.availability = null;
+  if (!row) return;
+  try {
+    const availability = await fetchDpAvailability(row);
+    if (row !== state.intersections[state.focusedIndex]) return;
+    state.dpExplore.availability = availability?.found ? availability : null;
+    btn.hidden = !availability?.found;
+    if (availability?.found) {
+      const meters = Math.round(Number(availability.nearestNode?.distanceMeters) || 0);
+      btn.title = `ほこナビ DP：最近節點約 ${meters} 公尺`;
+    }
+  } catch {
+    btn.hidden = true;
+  }
 }
 
 function renderIndoorNavigation(node, parentPanel) {
@@ -2125,6 +2359,7 @@ function focusIntersection(index, scrollIntoView = true, focusCard = true) {
   resetQuickStreetPanel();
   void updateQuickNavOsm(nextIndex);
   void warmupAdjacentOsmRoutePlaces(nextIndex, 2);
+  void refreshQuickDpButtonState();
 }
 
 function setBusy(btn, busy) {
@@ -3365,6 +3600,10 @@ $("quickStreetAdvanceBtn").addEventListener("click", () => {
 
 $("quickIndoorBtn").addEventListener("click", () => {
   void runQuickIndoorNavigation();
+});
+
+$("quickDpBtn").addEventListener("click", () => {
+  void runQuickDpExploration();
 });
 
 $("quickNav").addEventListener("keydown", (event) => {
